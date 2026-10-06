@@ -44,9 +44,14 @@ class PeakMemory:
             procs += self._proc.children(recursive=True)
         except psutil.Error:
             pass
-        for p in procs:
+        for i, p in enumerate(procs):
             try:
-                total += p.memory_info().rss
+                if i > 0 and sys.platform.startswith("linux"):
+                    # Spark 파이썬 워커는 서로 메모리 일부를 공유(fork)하므로 RSS를 그냥 더하면 부풀려진다.
+                    # PSS는 공유 메모리를 나눠 가진 만큼만 세서 합계가 실제 사용량에 가깝다.
+                    total += p.memory_full_info().pss
+                else:
+                    total += p.memory_info().rss
             except psutil.Error:
                 pass
         return total / (1024 * 1024)

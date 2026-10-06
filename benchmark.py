@@ -55,8 +55,19 @@ def run_step(script: str, opts: list[str], common: list[str], timeout: int) -> d
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
-            reason = "메모리 부족으로 강제 종료(OOM)" if proc.returncode in (-9, 137) else " / ".join(tail)
+            output = (proc.stdout or "") + (proc.stderr or "")
+            os.makedirs(os.path.join(OUT_DIR, "logs"), exist_ok=True)
+            log_path = os.path.join(OUT_DIR, "logs", f"{os.path.splitext(script)[0]}_{datetime.now():%H%M%S}.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(output)
+            if proc.returncode in (-9, 137):
+                reason = "메모리 부족으로 강제 종료(OOM)"
+            else:
+                # 진짜 원인이 담긴 줄(…Error: / …Exception:)을 찾아 보여 준다
+                errors = [ln.strip() for ln in output.splitlines()
+                          if ("Error" in ln or "Exception" in ln) and not ln.strip().startswith("at ")]
+                reason = (errors[-1][:200] if errors else "알 수 없는 오류")
+            reason += f" (전체 로그: data/benchmarks/logs/{os.path.basename(log_path)})"
             return {"error": reason}
         with open(metrics_path, encoding="utf-8") as f:
             content = f.read()
@@ -117,7 +128,7 @@ def main():
         common += ["--limit", str(args.limit)]
     scope = f"{month_label}, " + ("전체 행" if args.full else f"각 달 앞에서 {args.limit:,}행")
     scope_key = f"{args.year}-{','.join(map(str, months))}|{'full' if args.full else args.limit}"
-    spark_master = os.getenv("SPARK_MASTER", "local[*]")
+    spark_master = os.getenv("SPARK_MASTER", "")
     cluster = spark_master.startswith("spark://")
     if cluster:  # 클러스터 결과는 로컬 결과와 섞이지 않게 따로 쌓는다
         scope += f", Spark 클러스터({spark_master})"
@@ -163,7 +174,7 @@ def main():
     ]
     ok_rows = [row for row in rows if "error" not in row["result"]]
     if not ok_rows:
-        print("\n아직 성공한 결과가 없습니다. 먼저 기준을 측정하세요:  --step 0")
+        print("\n이 조건에서 성공한 단계가 아직 없어 표를 만들 수 없습니다. 위의 실패 원인과 로그를 확인하세요.")
         return
     base_row = ok_rows[0]
     base = base_row["result"]

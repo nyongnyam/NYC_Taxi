@@ -4,6 +4,7 @@ spark_pipeline.py — 같은 ETL을 Apache Spark(PySpark)로 처리한다.
     python spark_pipeline.py --months 1                    # raw: 정제한 모든 행을 clean_taxi_trips에 적재
     python spark_pipeline.py --months 1-6 --mode agg       # agg: 시간대·요일별 집계 결과만 적재
     python spark_pipeline.py --months 1 --limit 300000     # 각 달에서 앞의 N행만 (빠른 실험용)
+    python spark_pipeline.py --master "local[8]"            # 코어 8개 사용 (기본은 최대 4개)
     python spark_pipeline.py --master spark://spark-master:7077   # 클러스터로 실행 (docker compose의 spark 프로필)
 
 pandas 파이프라인과 다른 점:
@@ -186,10 +187,32 @@ def load_agg(df, year: int, months: list[int]) -> int:
     return loaded
 
 
-def run(year: int, months, mode: str = "raw", limit: int | None = None, master: str = "local[*]",
+def default_master() -> str:
+    """기본은 이 컴퓨터의 코어 중 최대 SPARK_LOCAL_CORES(기본 4)개만 쓴다.
+
+    local[*]는 모든 코어를 쓰는데, 코어마다 파이썬 워커가 하나씩 떠서 메모리를 쓴다.
+    코어가 28개인 PC에서는 워커 28개가 동시에 떠서 작은 데이터에도 메모리 한도를 넘길 수 있다.
+    """
+    env = os.getenv("SPARK_MASTER", "").strip()
+    if env:
+        return env
+    cores = min(os.cpu_count() or 1, int(os.getenv("SPARK_LOCAL_CORES", "4")))
+    return f"local[{cores}]"
+
+
+def parallelism_of(master: str) -> int:
+    """master 문자열에서 동시에 처리할 작업 수를 계산 (클러스터면 4를 기본으로)"""
+    if master.startswith("local["):
+        n = master[len("local["):-1]
+        return (os.cpu_count() or 1) if n == "*" else int(n)
+    return 4
+
+
+def run(year: int, months, mode: str = "raw", limit: int | None = None, master: str | None = None,
         driver_memory: str = "1g", partitions: int | None = None) -> dict:
     months = parse_months(months)
-    partitions = partitions or os.cpu_count() or 4
+    master = master or default_master()
+    partitions = partitions or parallelism_of(master)
     log.info(f"Spark 파이프라인 시작: {year}년 {months}월, mode={mode}, master={master}")
     metrics = {
         "engine": "spark",
@@ -218,10 +241,11 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="각 달에서 앞에서부터 N행만 처리")
     parser.add_argument("--mode", choices=["raw", "agg"], default="raw",
                         help="raw: 정제한 모든 행 적재 / agg: 시간대·요일별 집계만 적재")
-    parser.add_argument("--master", default=os.getenv("SPARK_MASTER", "local[*]"),
-                        help="local[*] = 이 컴퓨터의 모든 코어 / spark://host:7077 = 클러스터")
+    parser.add_argument("--master", default=None,
+                        help="local[4] = 이 컴퓨터의 코어 4개 / local[*] = 모든 코어 / spark://host:7077 = 클러스터 "
+                             "(기본: 환경 변수 SPARK_MASTER, 없으면 local[최대 4])")
     parser.add_argument("--driver-memory", default=os.getenv("SPARK_DRIVER_MEMORY", "1g"))
-    parser.add_argument("--partitions", type=int, default=None, help="병렬 처리·적재 단위 수 (기본: CPU 코어 수)")
+    parser.add_argument("--partitions", type=int, default=None, help="병렬 처리·적재 단위 수 (기본: 사용하는 코어 수)")
     parser.add_argument("--metrics-out", default=None)
     # benchmark.py가 pandas 파이프라인과 같은 옵션을 넘겨도 무시되도록
     parser.add_argument("--prune-columns", action="store_true", help=argparse.SUPPRESS)
