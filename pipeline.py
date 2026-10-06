@@ -220,7 +220,9 @@ def to_csv_buffer(df: pd.DataFrame, engine: str = "pandas") -> io.IOBase:
     """DataFrame → COPY에 넣을 CSV 버퍼.
 
     pandas: df.to_csv — 파이썬에서 한 줄씩 문자열을 만든다 (한 달 치 약 16초)
-    arrow : pyarrow.csv — C++로 여러 스레드가 변환한다 (한 달 치 약 2.5초, 병목 해결 ⑤)
+    arrow : pyarrow.csv — C++가 컬럼 단위로 묶어 변환한다 (한 달 치 약 2.5초, 병목 해결 ⑤).
+            변환 자체는 코어 1개를 쓰지만 실행 중 파이썬 GIL을 풀어 주므로,
+            병렬 COPY에서 스레드 여러 개가 동시에 변환할 수 있다 (pandas는 불가).
     """
     if engine == "arrow":
         import pyarrow as pa
