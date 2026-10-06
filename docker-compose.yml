@@ -7,6 +7,7 @@
 #   docker compose run --rm producer --limit 500000        # parquet → Kafka 재생
 #   docker compose --profile stream up -d --scale consumer=3   # consumer 수평 확장
 #   docker compose run --rm kafka-bench                    # 파티션 수 × consumer 수 처리량 실험
+#   docker compose --profile spark up -d --scale spark-worker=3   # Spark 클러스터 (마스터 1 + 워커 3)
 #
 # 호스트에서 직접 스크립트를 돌릴 때: DB는 localhost:${PG_PORT:-5432}, Kafka는 localhost:9094
 
@@ -23,6 +24,9 @@ x-app: &app
     KAFKA_TOPIC: ${KAFKA_TOPIC:-taxi-trips}
     KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
     COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
+    SPARK_MASTER: ${SPARK_MASTER:-local[*]}
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-1g}
   volumes:
     - ./data:/app/data            # 다운로드한 parquet 캐시를 호스트와 공유
   mem_limit: ${APP_MEM_LIMIT:-4g} # 메모리 병목 실험용 (예: APP_MEM_LIMIT=1g)
@@ -128,6 +132,29 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+
+  # ── Spark 클러스터 (분산 처리 실험용) ─────────────────────────
+  #   docker compose --profile spark up -d --scale spark-worker=3
+  #   docker compose run --rm -e SPARK_MASTER=spark://spark-master:7077 bench --step 5
+  spark-master:
+    <<: *app
+    profiles: ["spark"]
+    hostname: spark-master
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class",
+                 "org.apache.spark.deploy.master.Master", "--host", "spark-master"]
+    command: []
+    ports:
+      - "8090:8080"               # http://localhost:8090 — 워커 목록, 실행 중인 작업 확인
+
+  spark-worker:
+    <<: *app
+    profiles: ["spark"]
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class",
+                 "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    command: ["--cores", "${SPARK_WORKER_CORES:-1}", "--memory", "${SPARK_WORKER_MEMORY:-1g}"]
+    mem_limit: ${SPARK_WORKER_MEM_LIMIT:-2g}
+    depends_on:
+      - spark-master
 
 volumes:
   pgdata:

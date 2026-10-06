@@ -9,6 +9,7 @@ pipeline.py — NYC Yellow Taxi 배치 ETL (Extract → Transform → Load)
     python pipeline.py --prune-columns                            # + 필요한 컬럼만 읽기
     python pipeline.py --prune-columns --load-method copy         # + COPY 적재
     python pipeline.py --limit 300000                             # 앞에서 N행만 (빠른 실험용)
+    python pipeline.py --months 1-3 --prune-columns --load-method copy   # 여러 달 한 번에
 
 각 단계마다 소요 시간과 최대 메모리(RSS)를 로그로 남긴다. (docs/BOTTLENECKS.md 참고)
 """
@@ -21,16 +22,15 @@ import os
 import shutil
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
 
 import pandas as pd
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine, inspect, text
 
 import config
+from metrics import stage, summarize
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,26 +75,28 @@ class DataNotPublished(Exception):
     """NYC TLC에 아직 공개되지 않은 월 (보통 2~3개월 딜레이)"""
 
 
-# ── 측정 도구 ────────────────────────────────────────
-def peak_memory_mb() -> float:
-    """이 프로세스가 지금까지 사용한 최대 메모리(MB)"""
-    if sys.platform == "win32":
-        import psutil  # Windows에는 resource 모듈이 없음
-        return psutil.Process().memory_info().peak_wset / (1024 * 1024)
-    import resource
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Linux는 KB, macOS는 byte 단위로 반환
-    return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
+def parse_months(text: str | int | list) -> list[int]:
+    """'1' / '1-3' / '1,4,7' / 3 / [1, 2] → 월 목록"""
+    if isinstance(text, int):
+        return [text]
+    if isinstance(text, list):
+        return text
+    months = []
+    for part in str(text).split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            months += list(range(int(lo), int(hi) + 1))
+        else:
+            months.append(int(part))
+    months = sorted(set(months))
+    if not all(1 <= m <= 12 for m in months):
+        raise ValueError(f"월은 1~12 사이여야 합니다: {text}")
+    return months
 
 
-@contextmanager
-def stage(name: str, metrics: dict):
-    start = time.perf_counter()
-    yield
-    elapsed = time.perf_counter() - start
-    mem = peak_memory_mb()
-    metrics["stages"][name] = {"seconds": round(elapsed, 3), "peak_mb": round(mem)}
-    log.info(f"  ⏱ {name}: {elapsed:.1f}초 (최대 메모리 {mem:,.0f}MB)")
+def month_ranges(year: int, months: list[int]) -> list[tuple[str, str]]:
+    """각 월의 [시작일, 다음 달 시작일) 범위"""
+    return [(f"{year}-{m:02d}-01", f"{year + (m == 12)}-{m % 12 + 1:02d}-01") for m in months]
 
 
 # ── Extract ──────────────────────────────────────────
@@ -140,22 +142,29 @@ def download(year: int, month: int, use_cache: bool = True) -> str:
     return local_path
 
 
-def extract(year: int, month: int, limit: int | None = None,
+def extract(year: int, months, limit: int | None = None,
             use_cache: bool = True, prune_columns: bool = False) -> pd.DataFrame:
-    local_path = download(year, month, use_cache)
+    """months의 parquet을 읽어 하나의 DataFrame으로 합친다. limit은 '각 달에서 앞에서 N행'."""
+    frames = []
+    for month in parse_months(months):
+        local_path = download(year, month, use_cache)
 
-    columns = None
-    if prune_columns:
-        # parquet은 컬럼 단위로 저장되므로, 지정하지 않은 컬럼은 디스크에서 읽지도 않는다 (병목 해결 ②)
-        schema  = pq.read_schema(local_path)
-        columns = [name for name in schema.names if name.lower() in RAW_COLUMNS]
-    df = pd.read_parquet(local_path, columns=columns)
+        columns = None
+        if prune_columns:
+            # parquet은 컬럼 단위로 저장되므로, 지정하지 않은 컬럼은 디스크에서 읽지도 않는다 (병목 해결 ②)
+            schema  = pq.read_schema(local_path)
+            columns = [name for name in schema.names if name.lower() in RAW_COLUMNS]
+        df = pd.read_parquet(local_path, columns=columns)
+        df.columns = df.columns.str.lower()  # 달마다 컬럼 대소문자가 다른 경우가 있음
 
-    if not use_cache:
-        shutil.rmtree(os.path.dirname(local_path), ignore_errors=True)
+        if not use_cache:
+            shutil.rmtree(os.path.dirname(local_path), ignore_errors=True)
+        if limit:
+            df = df.head(limit)
+        frames.append(df)
 
-    if limit:
-        df = df.head(limit)
+    df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+    del frames
     log.info(f"  로드 완료: {len(df):,}행 × {len(df.columns)}컬럼")
     return df
 
@@ -193,13 +202,13 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     return df[TABLE_COLUMNS]
 
 
-def transform(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+def transform(df: pd.DataFrame, year: int, months) -> pd.DataFrame:
     log.info("정제 시작...")
     before = len(df)
 
     # 해당 연·월 데이터만 유지 (파일 안에 섞여 있는 다른 기간 레코드 제거)
     pickup = pd.to_datetime(df["tpep_pickup_datetime"])
-    df = df[(pickup.dt.year == year) & (pickup.dt.month == month)]
+    df = df[(pickup.dt.year == year) & (pickup.dt.month.isin(parse_months(months)))]
 
     df = clean(df)
     log.info(f"  정제 완료: {before:,} → {len(df):,}행")
@@ -225,23 +234,27 @@ def copy_dataframe(dbapi_conn, df: pd.DataFrame, table: str = config.TABLE_NAME,
             cur.copy_expert(sql, buf)
 
 
-def load(df: pd.DataFrame, year: int, month: int, method: str = "multi",
+def delete_months(conn, year: int, months, table: str = config.TABLE_NAME) -> int:
+    """같은 월을 다시 돌려도 중복 적재되지 않도록 해당 월을 먼저 삭제 (멱등성)"""
+    if not inspect(conn).has_table(table):
+        return 0
+    deleted = 0
+    for start, end in month_ranges(year, parse_months(months)):
+        deleted += conn.execute(
+            text(f'DELETE FROM "{table}" WHERE tpep_pickup_datetime >= :start AND tpep_pickup_datetime < :end'),
+            {"start": start, "end": end},
+        ).rowcount
+    return deleted
+
+
+def load(df: pd.DataFrame, year: int, months, method: str = "multi",
          chunk_rows: int = COPY_CHUNK_ROWS):
     log.info(f"PostgreSQL 적재 중... (방식: {method})")
-    start = f"{year}-{month:02d}-01"
-    end   = f"{year + (month == 12)}-{month % 12 + 1:02d}-01"
 
     with engine.begin() as conn:
-        # 같은 월을 다시 돌려도 중복 적재되지 않도록 해당 월을 먼저 삭제 (멱등성)
-        if inspect(conn).has_table(config.TABLE_NAME):
-            deleted = conn.execute(
-                text(f'DELETE FROM "{config.TABLE_NAME}" '
-                     "WHERE tpep_pickup_datetime >= :start "
-                     "AND tpep_pickup_datetime < :end"),
-                {"start": start, "end": end},
-            ).rowcount
-            if deleted:
-                log.info(f"  기존 {year}-{month:02d} 데이터 {deleted:,}행 삭제")
+        deleted = delete_months(conn, year, months)
+        if deleted:
+            log.info(f"  기존 데이터 {deleted:,}행 삭제")
 
         if method == "copy":
             copy_dataframe(conn.connection, df, chunk_rows=chunk_rows)
@@ -260,13 +273,15 @@ def load(df: pd.DataFrame, year: int, month: int, method: str = "multi",
 
 
 # ── Run ──────────────────────────────────────────────
-def run(year: int = 2024, month: int = 1, load_method: str = "multi",
+def run(year: int = 2024, months=1, load_method: str = "multi",
         limit: int | None = None, use_cache: bool = True, prune_columns: bool = False,
         copy_chunk_rows: int = COPY_CHUNK_ROWS) -> dict:
-    log.info(f"파이프라인 시작: {year}-{month:02d}")
+    months = parse_months(months)
+    log.info(f"파이프라인 시작: {year}년 {months}월")
     metrics = {
+        "engine": "pandas",
         "options": {
-            "year": year, "month": month, "limit": limit, "use_cache": use_cache,
+            "year": year, "months": months, "limit": limit, "use_cache": use_cache,
             "prune_columns": prune_columns, "load_method": load_method,
             "copy_chunk_rows": copy_chunk_rows if load_method == "copy" else None,
         },
@@ -274,30 +289,22 @@ def run(year: int = 2024, month: int = 1, load_method: str = "multi",
     }
 
     with stage("extract", metrics):
-        raw = extract(year, month, limit, use_cache, prune_columns)
+        raw = extract(year, months, limit, use_cache, prune_columns)
     with stage("transform", metrics):
-        cleaned = transform(raw, year, month)
+        cleaned = transform(raw, year, months)
     del raw  # 원본 DataFrame 메모리 해제
     with stage("load", metrics):
-        load(cleaned, year, month, method=load_method, chunk_rows=copy_chunk_rows)
+        load(cleaned, year, months, method=load_method, chunk_rows=copy_chunk_rows)
 
-    total = sum(s["seconds"] for s in metrics["stages"].values())
-    metrics["total_seconds"] = round(total, 3)
-    metrics["peak_mb"] = round(peak_memory_mb())
-    metrics["rows_loaded"] = len(cleaned)
-
-    summary = " | ".join(
-        f"{k} {v['seconds']:.1f}s ({v['seconds'] / total:.0%})" for k, v in metrics["stages"].items()
-    )
-    log.info(f"파이프라인 완료: 총 {total:.1f}초, 최대 메모리 {metrics['peak_mb']:,}MB — {summary}")
-    return metrics
+    return summarize(metrics, len(cleaned))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NYC Yellow Taxi 배치 ETL")
     parser.add_argument("--year",  type=int, default=2024)
-    parser.add_argument("--month", type=int, default=1, choices=range(1, 13))
-    parser.add_argument("--limit", type=int, default=None, help="앞에서부터 N행만 처리 (빠른 실험용)")
+    parser.add_argument("--month", "--months", dest="months", default="1",
+                        help="처리할 월. 하나(1), 범위(1-3), 목록(1,4,7)")
+    parser.add_argument("--limit", type=int, default=None, help="각 달에서 앞에서부터 N행만 처리 (빠른 실험용)")
     parser.add_argument("--no-cache", action="store_true",
                         help="다운로드 캐시를 쓰지 않고 매번 새로 받기 (캐싱 도입 전 상태)")
     parser.add_argument("--prune-columns", action="store_true",
@@ -310,7 +317,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        result = run(args.year, args.month, args.load_method, args.limit,
+        result = run(args.year, args.months, args.load_method, args.limit,
                      use_cache=not args.no_cache, prune_columns=args.prune_columns,
                      copy_chunk_rows=args.copy_chunk_rows)
     except DataNotPublished as e:

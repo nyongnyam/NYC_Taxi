@@ -12,6 +12,7 @@ benchmark.py — 병목 해결 기법을 하나씩 켜면서 시간·메모리�
 한 번에 전부:
     python benchmark.py                      # 0~4단계 (30만 행, 몇 분)
     python benchmark.py --full --step 3      # 한 달 전체 (행 수가 다르면 결과도 따로 쌓임)
+    python benchmark.py --months 1-6 --full --steps 4,5,6   # 여러 달 규모 실험 (pandas vs Spark)
     python benchmark.py --repeat 3           # 단계마다 3번 돌려 중앙값 사용
 
 단계마다 pipeline.py를 별도 프로세스로 실행해 메모리 측정이 서로 섞이지 않게 한다.
@@ -29,20 +30,28 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(BASE_DIR, "data", "benchmarks")
 
-# (단계 번호, 이름, 이 단계에서 새로 적용한 기법, pipeline.py 옵션)
+# (단계 번호, 이름, 이 단계에서 새로 적용한 기법, 실행 옵션, 실행할 스크립트)
 STEPS = [
-    (0, "기존 코드 (기준)", "-", ["--no-cache", "--load-method", "multi"]),
-    (1, "+ 다운로드 캐싱", "이미 받은 parquet 재사용", ["--load-method", "multi"]),
-    (2, "+ 컬럼 프루닝", "19개 중 필요한 8개 컬럼만 읽기", ["--prune-columns", "--load-method", "multi"]),
-    (3, "+ COPY 적재", "다중 행 INSERT → PostgreSQL COPY", ["--prune-columns", "--load-method", "copy", "--copy-chunk-rows", "0"]),
-    (4, "+ 청크 COPY", "COPY를 20만 행씩 나눠 전송", ["--prune-columns", "--load-method", "copy"]),
+    (0, "기존 코드 (기준)", "-", ["--no-cache", "--load-method", "multi"], "pipeline.py"),
+    (1, "+ 다운로드 캐싱", "이미 받은 parquet 재사용", ["--load-method", "multi"], "pipeline.py"),
+    (2, "+ 컬럼 프루닝", "19개 중 필요한 8개 컬럼만 읽기", ["--prune-columns", "--load-method", "multi"], "pipeline.py"),
+    (3, "+ COPY 적재", "다중 행 INSERT → PostgreSQL COPY",
+     ["--prune-columns", "--load-method", "copy", "--copy-chunk-rows", "0"], "pipeline.py"),
+    (4, "+ 청크 COPY", "COPY를 20만 행씩 나눠 전송", ["--prune-columns", "--load-method", "copy"], "pipeline.py"),
+    (5, "+ Spark 분산 처리", "pandas → Spark(코어 수만큼 파티션 병렬 처리·COPY)", ["--mode", "raw"], "spark_pipeline.py"),
+    (6, "+ Spark 사전 집계", "원본 행 대신 시간대·요일별 집계만 적재", ["--mode", "agg"], "spark_pipeline.py"),
 ]
+STAGE_ORDER = ["startup", "extract", "transform", "load", "process"]
 
 
-def run_step(opts: list[str], common: list[str], timeout: int) -> dict:
+def stage_text(stages: dict) -> str:
+    return " / ".join(f"{k} {stages[k]['seconds']:.1f}s" for k in STAGE_ORDER if k in stages)
+
+
+def run_step(script: str, opts: list[str], common: list[str], timeout: int) -> dict:
     fd, metrics_path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
-    cmd = [sys.executable, os.path.join(BASE_DIR, "pipeline.py"), *common, *opts, "--metrics-out", metrics_path]
+    cmd = [sys.executable, os.path.join(BASE_DIR, script), *common, *opts, "--metrics-out", metrics_path]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
@@ -87,10 +96,11 @@ def load_history(path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="병목 해결 전·후 비교 벤치마크")
     parser.add_argument("--year", type=int, default=2024)
-    parser.add_argument("--month", type=int, default=1, choices=range(1, 13))
+    parser.add_argument("--month", "--months", dest="months", default="1",
+                        help="측정할 월. 하나(1), 범위(1-6) — 여러 달이면 규모 실험")
     parser.add_argument("--limit", type=int, default=300_000, help="처리할 행 수 (기본 30만)")
     parser.add_argument("--full", action="store_true", help="한 달 전체 데이터로 측정")
-    parser.add_argument("--step", "--steps", dest="steps", default="0,1,2,3,4",
+    parser.add_argument("--step", "--steps", dest="steps", default="0,1,2,3,4,5,6",
                         help="실행할 단계 번호. 하나만(--step 2) 또는 여러 개(--steps 0,3)")
     parser.add_argument("--repeat", type=int, default=1, help="단계마다 반복 횟수 (중앙값 사용)")
     parser.add_argument("--timeout", type=int, default=1800, help="단계별 최대 실행 시간(초)")
@@ -98,11 +108,20 @@ def main():
     parser.add_argument("--reset", action="store_true", help="이 조건(월·행 수)으로 쌓인 결과를 지우고 시작")
     args = parser.parse_args()
 
-    common = ["--year", str(args.year), "--month", str(args.month)]
+    sys.path.insert(0, BASE_DIR)
+    from pipeline import download, parse_months
+    months = parse_months(args.months)
+    month_label = f"{args.year}년 {months[0]}월" if len(months) == 1 else f"{args.year}년 {months[0]}~{months[-1]}월"
+    common = ["--year", str(args.year), "--months", ",".join(map(str, months))]
     if not args.full:
         common += ["--limit", str(args.limit)]
-    scope = "한 달 전체" if args.full else f"앞에서 {args.limit:,}행"
-    scope_key = f"{args.year}-{args.month:02d}|{'full' if args.full else args.limit}"
+    scope = f"{month_label}, " + ("전체 행" if args.full else f"각 달 앞에서 {args.limit:,}행")
+    scope_key = f"{args.year}-{','.join(map(str, months))}|{'full' if args.full else args.limit}"
+    spark_master = os.getenv("SPARK_MASTER", "local[*]")
+    cluster = spark_master.startswith("spark://")
+    if cluster:  # 클러스터 결과는 로컬 결과와 섞이지 않게 따로 쌓는다
+        scope += f", Spark 클러스터({spark_master})"
+        scope_key += "|cluster"
 
     os.makedirs(OUT_DIR, exist_ok=True)
     history_path = os.path.join(OUT_DIR, "history.json")
@@ -119,21 +138,17 @@ def main():
 
         # 캐시를 쓰는 단계 전에 파일을 미리 받아 둔다 (측정에 포함하지 않음)
         if any(st[0] >= 1 for st in steps):
-            sys.path.insert(0, BASE_DIR)
-            from pipeline import download
-            download(args.year, args.month, use_cache=True)
+            for m in months:
+                download(args.year, m, use_cache=True)
 
-        print(f"\n벤치마크: {args.year}-{args.month:02d}, {scope}, 단계 {[st[0] for st in steps]}, 반복 {args.repeat}회\n")
-        for num, name, technique, opts in steps:
-            print(f"[{num}] {name} 실행 중... (옵션: {' '.join(opts)})", flush=True)
-            r = median_result([run_step(opts, common, args.timeout) for _ in range(args.repeat)])
+        print(f"\n벤치마크: {scope}, 단계 {[st[0] for st in steps]}, 반복 {args.repeat}회\n")
+        for num, name, technique, opts, script in steps:
+            print(f"[{num}] {name} 실행 중... ({script} {' '.join(opts)})", flush=True)
+            r = median_result([run_step(script, opts, common, args.timeout) for _ in range(args.repeat)])
             if "error" in r:
                 print(f"    → 실패: {r['error']}")
             else:
-                st = r["stages"]
-                print(f"    → {r['total_seconds']:.1f}초, 최대 {r['peak_mb']:,}MB "
-                      f"(extract {st['extract']['seconds']:.1f}s / transform {st['transform']['seconds']:.1f}s"
-                      f" / load {st['load']['seconds']:.1f}s)")
+                print(f"    → {r['total_seconds']:.1f}초, 최대 {r['peak_mb']:,}MB ({stage_text(r['stages'])})")
             r["measured_at"] = f"{datetime.now():%Y-%m-%d %H:%M}"
             saved[str(num)] = r
             just_ran.add(num)
@@ -144,7 +159,7 @@ def main():
     # ── 지금까지 쌓인 결과로 표 만들기 ──
     rows = [
         {"num": num, "name": name, "technique": technique, "result": saved[str(num)]}
-        for num, name, technique, _ in STEPS if str(num) in saved
+        for num, name, technique, _, _ in STEPS if str(num) in saved
     ]
     ok_rows = [row for row in rows if "error" not in row["result"]]
     if not ok_rows:
@@ -154,7 +169,7 @@ def main():
     base = base_row["result"]
 
     lines = [
-        f"# 벤치마크 결과 — {args.year}-{args.month:02d}, {scope}",
+        f"# 벤치마크 결과 — {scope}",
         "",
         f"기준: [{base_row['num']}] {base_row['name']}  (★ = 이번에 실행한 단계)",
         "",
@@ -186,16 +201,22 @@ def main():
         csv_rows.append({
             "step": row["num"], "name": row["name"], "technique": row["technique"],
             "total_seconds": r["total_seconds"], "peak_mb": r["peak_mb"],
-            "extract_s": st["extract"]["seconds"], "transform_s": st["transform"]["seconds"],
-            "load_s": st["load"]["seconds"], "rows_loaded": r["rows_loaded"],
+            **{f"{k}_s": st[k]["seconds"] for k in STAGE_ORDER if k in st},
+            "rows_loaded": r["rows_loaded"],
         })
         prev = r
 
-    lines += ["", "## 구간별 시간 (초)", "", "| 단계 | extract | transform | load | 적재 행 수 |", "|---|---|---|---|---|"]
+    used = [k for k in STAGE_ORDER if any(k in row["result"]["stages"] for row in ok_rows)]
+    lines += ["", "## 구간별 시간 (초)", "",
+              "| 단계 | " + " | ".join(used) + " | 적재 행 수 |",
+              "|---|" + "---|" * len(used) + "---|"]
     for row in ok_rows:
         st = row["result"]["stages"]
-        lines.append(f"| [{row['num']}] {row['name']} | {st['extract']['seconds']:.1f} | "
-                     f"{st['transform']['seconds']:.1f} | {st['load']['seconds']:.1f} | {row['result']['rows_loaded']:,} |")
+        cells = " | ".join(f"{st[k]['seconds']:.1f}" if k in st else "-" for k in used)
+        lines.append(f"| [{row['num']}] {row['name']} | {cells} | {row['result']['rows_loaded']:,} |")
+    if any(row["num"] >= 5 for row in ok_rows):
+        lines += ["", "Spark는 지연 실행이라 읽기·정제·적재가 `process` 구간에서 한꺼번에 실행된다. "
+                  "`startup`은 Spark 세션(JVM) 준비 시간. 6단계의 적재 행 수는 원본이 아니라 집계 결과 행 수다."]
 
     report = "\n".join(lines)
     print("\n" + report + "\n")
@@ -205,7 +226,7 @@ def main():
         nxt = remaining[0]
         print(f"다음 단계: --step {nxt[0]}  ({nxt[1]} — {nxt[2]})\n")
 
-    slug = f"{args.year}-{args.month:02d}_{'full' if args.full else args.limit}"
+    slug = f"{args.year}-{'-'.join(map(str, months))}_{'full' if args.full else args.limit}" + ("_cluster" if cluster else "")
     md_path = os.path.join(OUT_DIR, f"bench_{slug}.md")
     csv_path = os.path.join(OUT_DIR, f"bench_{slug}.csv")
     with open(md_path, "w", encoding="utf-8") as f:

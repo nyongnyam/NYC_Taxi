@@ -1,0 +1,240 @@
+"""
+spark_pipeline.py — 같은 ETL을 Apache Spark(PySpark)로 처리한다.
+
+    python spark_pipeline.py --months 1                    # raw: 정제한 모든 행을 clean_taxi_trips에 적재
+    python spark_pipeline.py --months 1-6 --mode agg       # agg: 시간대·요일별 집계 결과만 적재
+    python spark_pipeline.py --months 1 --limit 300000     # 각 달에서 앞의 N행만 (빠른 실험용)
+    python spark_pipeline.py --master spark://spark-master:7077   # 클러스터로 실행 (docker compose의 spark 프로필)
+
+pandas 파이프라인과 다른 점:
+    - 지연 실행(lazy): 읽기·정제는 계획만 세우고, 실제 계산은 적재(쓰기)를 시작할 때 한꺼번에 일어난다.
+      그래서 측정 구간이 startup(세션 준비)과 process(읽기+정제+적재)로 나뉜다.
+    - 파티션 단위 처리: 데이터를 파티션으로 나눠 코어마다 동시에 처리하고,
+      raw 모드에서는 파티션마다 DB 연결을 따로 열어 COPY를 병렬로 보낸다.
+      (파티션마다 따로 커밋하므로 중간에 실패하면 일부만 적재될 수 있다 — pandas 쪽 단일 트랜잭션과의 차이)
+    - 메모리: 전체 데이터를 한 번에 올리지 않고 파티션 단위로 흘려보내므로, 데이터가 메모리보다 커도 처리할 수 있다.
+"""
+
+import argparse
+import json
+import logging
+import os
+
+import psycopg2
+
+import config
+from metrics import stage, summarize
+from pipeline import DataNotPublished, RAW_COLUMNS, TABLE_COLUMNS, download, month_ranges, parse_months
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("spark_pipeline")
+
+AGG_SQL = os.path.join(config.BASE_DIR, "sql", "agg_tables.sql")
+
+
+def build_session(master: str, driver_memory: str, shuffle_partitions: int):
+    import socket
+
+    from pyspark.sql import SparkSession
+    builder = SparkSession.builder.appName("nyc-taxi-etl").master(master)
+    if master.startswith("spark://"):
+        # 클러스터 모드: 워커(executor)들이 이 드라이버에 다시 접속할 수 있도록 IP를 알려 준다
+        builder = (builder
+                   .config("spark.driver.host", socket.gethostbyname(socket.gethostname()))
+                   .config("spark.driver.bindAddress", "0.0.0.0")
+                   .config("spark.executor.memory", os.getenv("SPARK_EXECUTOR_MEMORY", "1g")))
+    spark = (
+        builder
+        .config("spark.driver.memory", driver_memory)
+        .config("spark.sql.session.timeZone", "UTC")          # 시간을 변환 없이 그대로 다룬다
+        .config("spark.sql.shuffle.partitions", shuffle_partitions)
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("spark.sql.execution.arrow.maxRecordsPerBatch", 50_000)
+        .config("spark.ui.showConsoleProgress", "false")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+
+def read_months(spark, year: int, months: list[int], limit: int | None):
+    """달마다 파일을 읽어 필요한 컬럼만 같은 타입으로 맞춘 뒤 합친다 (달마다 스키마가 조금씩 다름)."""
+    from pyspark.sql import functions as F
+
+    frames = []
+    for month in months:
+        path = download(year, month, use_cache=True)
+        df = spark.read.parquet(path)
+        cols = {c.lower(): c for c in df.columns}
+        df = df.select(
+            F.col(cols["vendorid"]).cast("int").alias("vendor_id"),
+            F.col(cols["tpep_pickup_datetime"]).cast("timestamp").alias("tpep_pickup_datetime"),
+            F.col(cols["tpep_dropoff_datetime"]).cast("timestamp").alias("tpep_dropoff_datetime"),
+            *[F.col(cols[c]).cast("double").alias(c) for c in RAW_COLUMNS[3:]],
+        )
+        if limit:
+            # 그냥 limit()을 쓰면 먼저 끝난 파티션의 행을 가져와서 매번 다른 행이 뽑힌다.
+            # 파일 순서대로 번호를 매긴 뒤 앞에서 N행을 가져와 pandas의 head()와 같은 행을 쓴다.
+            df = (df.withColumn("_row_id", F.monotonically_increasing_id())
+                    .orderBy("_row_id").limit(limit).drop("_row_id"))
+        frames.append(df)
+
+    df = frames[0]
+    for other in frames[1:]:
+        df = df.unionByName(other)
+    return df
+
+
+def transform(df, year: int, months: list[int]):
+    """pipeline.clean()과 같은 규칙을 Spark 함수로 옮긴 것"""
+    from pyspark.sql import functions as F
+
+    pickup, dropoff = F.col("tpep_pickup_datetime"), F.col("tpep_dropoff_datetime")
+    df = (
+        df.where((F.year(pickup) == year) & F.month(pickup).isin(months))
+        .where((F.col("trip_distance") > 0) & (F.col("fare_amount") > 0) & (F.col("total_amount") > 0))
+        .where(F.col("passenger_count").between(1, 6))
+        .withColumn("trip_duration_min", F.round((F.unix_timestamp(dropoff) - F.unix_timestamp(pickup)) / 60, 2))
+        .withColumn("pickup_hour", F.hour(pickup))
+        .withColumn("pickup_weekday", F.date_format(pickup, "EEEE"))
+        .withColumn("tip_rate", F.round(F.col("tip_amount") / F.col("fare_amount"), 4))
+        .where(F.col("trip_duration_min").between(1, 180))
+    )
+    return df.select(*TABLE_COLUMNS)
+
+
+def _connect():
+    return psycopg2.connect(**config.psycopg2_kwargs())
+
+
+def load_raw(df, year: int, months: list[int], partitions: int) -> int:
+    """파티션마다 DB 연결을 열어 COPY를 병렬로 보낸다."""
+    deleted = 0
+    with _connect() as conn, conn.cursor() as cur:
+        for start, end in month_ranges(year, months):
+            cur.execute(f'DELETE FROM "{config.TABLE_NAME}" WHERE tpep_pickup_datetime >= %s '
+                        "AND tpep_pickup_datetime < %s", (start, end))
+            deleted += cur.rowcount
+    if deleted:
+        log.info(f"  기존 데이터 {deleted:,}행 삭제")
+
+    conn_kwargs = config.psycopg2_kwargs()
+    table = config.TABLE_NAME
+    copy_sql = f'COPY "{table}" ({", ".join(TABLE_COLUMNS)}) FROM STDIN WITH (FORMAT csv)'
+
+    def write_partition(batches):
+        # 이 함수는 Spark 워커 프로세스 안에서 파티션마다 한 번 실행된다
+        import io
+
+        import pandas as pd
+        import psycopg2 as pg
+
+        conn = pg.connect(**conn_kwargs)
+        written = 0
+        try:
+            with conn.cursor() as cur:
+                for pdf in batches:
+                    if pdf.empty:
+                        continue
+                    buf = io.StringIO()
+                    pdf.to_csv(buf, index=False, header=False)
+                    buf.seek(0)
+                    cur.copy_expert(copy_sql, buf)
+                    written += len(pdf)
+            conn.commit()
+        finally:
+            conn.close()
+        yield pd.DataFrame({"rows": [written]})
+
+    log.info(f"PostgreSQL 적재 중... (Spark 파티션 {partitions}개가 병렬로 COPY)")
+    result = df.repartition(partitions).mapInPandas(write_partition, schema="rows long")
+    loaded = result.groupBy().sum("rows").collect()[0][0] or 0
+    log.info(f"  적재 완료: {loaded:,}행")
+    return loaded
+
+
+def load_agg(df, year: int, months: list[int]) -> int:
+    """원본 행 대신 월·시간대·요일별 집계만 적재한다 (합계와 건수를 저장해 여러 달을 다시 합칠 수 있게)."""
+    from pyspark.sql import functions as F
+
+    month_col = F.trunc("tpep_pickup_datetime", "month").alias("month")
+    measures = [
+        F.count("*").alias("trip_count"),
+        F.sum("fare_amount").alias("fare_sum"),
+        F.sum("trip_duration_min").alias("duration_sum"),
+        F.sum("tip_rate").alias("tip_rate_sum"),
+        F.sum("total_amount").alias("revenue_sum"),
+    ]
+    df = df.cache()  # 두 가지 집계에 같은 데이터를 쓰므로 한 번만 계산
+    hourly = df.groupBy(month_col, "pickup_hour").agg(*measures).toPandas()
+    weekday = df.groupBy(month_col, "pickup_weekday").agg(*measures).toPandas()
+    df.unpersist()
+
+    log.info(f"PostgreSQL 적재 중... (집계 결과 {len(hourly) + len(weekday):,}행)")
+    with _connect() as conn, conn.cursor() as cur:
+        with open(AGG_SQL, encoding="utf-8") as f:
+            cur.execute(f.read())
+        for table, frame in (("agg_hourly_monthly", hourly), ("agg_weekday_monthly", weekday)):
+            for start, end in month_ranges(year, months):
+                cur.execute(f"DELETE FROM {table} WHERE month >= %s AND month < %s", (start, end))
+            rows = frame.astype(object).where(frame.notna(), None).values.tolist()  # numpy 값 → 파이썬 값
+            cols = ", ".join(frame.columns)
+            placeholders = ", ".join(["%s"] * len(frame.columns))
+            cur.executemany(f"INSERT INTO {table} ({cols}) VALUES ({placeholders})", rows)
+    loaded = len(hourly) + len(weekday)
+    log.info(f"  적재 완료: {loaded:,}행 (원본 {int(hourly['trip_count'].sum()):,}건을 요약)")
+    return loaded
+
+
+def run(year: int, months, mode: str = "raw", limit: int | None = None, master: str = "local[*]",
+        driver_memory: str = "1g", partitions: int | None = None) -> dict:
+    months = parse_months(months)
+    partitions = partitions or os.cpu_count() or 4
+    log.info(f"Spark 파이프라인 시작: {year}년 {months}월, mode={mode}, master={master}")
+    metrics = {
+        "engine": "spark",
+        "options": {"year": year, "months": months, "limit": limit, "mode": mode, "master": master,
+                    "driver_memory": driver_memory, "partitions": partitions},
+        "stages": {},
+    }
+
+    with stage("startup", metrics):
+        spark = build_session(master, driver_memory, partitions)
+    try:
+        with stage("process", metrics):  # 읽기 + 정제 + 적재 (지연 실행이라 여기서 한꺼번에 실행됨)
+            df = transform(read_months(spark, year, months, limit), year, months)
+            loaded = load_agg(df, year, months) if mode == "agg" else load_raw(df, year, months, partitions)
+    finally:
+        spark.stop()
+
+    return summarize(metrics, loaded)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="NYC Yellow Taxi ETL — Spark 버전")
+    parser.add_argument("--year", type=int, default=2024)
+    parser.add_argument("--month", "--months", dest="months", default="1",
+                        help="처리할 월. 하나(1), 범위(1-3), 목록(1,4,7)")
+    parser.add_argument("--limit", type=int, default=None, help="각 달에서 앞에서부터 N행만 처리")
+    parser.add_argument("--mode", choices=["raw", "agg"], default="raw",
+                        help="raw: 정제한 모든 행 적재 / agg: 시간대·요일별 집계만 적재")
+    parser.add_argument("--master", default=os.getenv("SPARK_MASTER", "local[*]"),
+                        help="local[*] = 이 컴퓨터의 모든 코어 / spark://host:7077 = 클러스터")
+    parser.add_argument("--driver-memory", default=os.getenv("SPARK_DRIVER_MEMORY", "1g"))
+    parser.add_argument("--partitions", type=int, default=None, help="병렬 처리·적재 단위 수 (기본: CPU 코어 수)")
+    parser.add_argument("--metrics-out", default=None)
+    # benchmark.py가 pandas 파이프라인과 같은 옵션을 넘겨도 무시되도록
+    parser.add_argument("--prune-columns", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--load-method", default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    try:
+        result = run(args.year, args.months, args.mode, args.limit, args.master,
+                     args.driver_memory, args.partitions)
+    except DataNotPublished as e:
+        log.warning(f"건너뜀: {e}")
+        raise SystemExit(0)
+
+    if args.metrics_out:
+        with open(args.metrics_out, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)

@@ -5,6 +5,7 @@
 ![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white)
 ![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![Apache Spark](https://img.shields.io/badge/Apache%20Spark-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white)
 
 # 뉴욕 택시 운행 기록을 사용한 택시 운전 기사 수익 최적화 대시보드
 
@@ -38,7 +39,8 @@
 - **데이터 적재**: Python `SQLAlchemy` 라이브러리를 활용해 정제 결과를 로컬 PostgreSQL에 적재
 - **시각화**: Tableau Desktop을 이용해 BI 대시보드 구성
 - **스트리밍(실험)**: Apache Kafka — parquet을 운행 이벤트로 재생해 Producer → 토픽 → Consumer → PostgreSQL 경로로 적재
-- **실행 환경**: Docker Compose — PostgreSQL, Kafka, Kafka UI, 파이프라인 컨테이너를 한 번에 구성
+- **대용량 처리(실험)**: Apache Spark — 같은 ETL을 파티션 단위로 처리, 로컬 모드와 마스터·워커 클러스터 모드 지원
+- **실행 환경**: Docker Compose — PostgreSQL, Kafka, Kafka UI, Spark 클러스터, 파이프라인 컨테이너를 한 번에 구성
 - **버전 관리**: Git을 통한 코드 및 Tableau 워크북 관리
 
 ## 3. ETL 파이프라인 상세
@@ -223,6 +225,8 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ## 8. 실행 방법
 
+전체 실험 순서와 문제 해결은 [docs/RUNNING.md](docs/RUNNING.md), 측정 결과와 해석은 [docs/BOTTLENECKS.md](docs/BOTTLENECKS.md)에 정리했다.
+
 ### Docker Compose (권장)
 
 ```bash
@@ -234,6 +238,9 @@ docker compose run --rm bench --step 0                         # 병목 해결 �
 docker compose --profile stream up -d consumer              # 스트리밍 consumer
 docker compose run --rm producer --year 2024 --month 1      # parquet → Kafka
 docker compose run --rm kafka-bench                         # 파티션 수 × consumer 수 처리량 실험
+
+docker compose run --rm bench --months 1-6 --full --steps 4,5,6   # pandas vs Spark 규모 실험
+docker compose --profile spark up -d --scale spark-worker=3      # Spark 클러스터
 ```
 
 - Kafka UI: http://localhost:8080
