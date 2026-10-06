@@ -25,7 +25,7 @@ x-app: &app
     KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
     COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
     CSV_ENGINE: ${CSV_ENGINE:-pandas}
-    COPY_WORKERS: ${COPY_WORKERS:-1}
+    COPY_WORKERS: ${COPY_WORKERS:-}               # 비우면: 기본 1, 8·9단계는 자동(코어 수, 최대 8)
     SPARK_MASTER: ${SPARK_MASTER:-}               # 비우면 local[최대 SPARK_LOCAL_CORES]
     SPARK_LOCAL_CORES: ${SPARK_LOCAL_CORES:-4}
     SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-auto}

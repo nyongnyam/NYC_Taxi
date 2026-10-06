@@ -310,8 +310,10 @@ def delete_months(conn, year: int, months, table: str = config.TABLE_NAME) -> in
 def load(df: pd.DataFrame, year: int, months, method: str = "multi",
          chunk_rows: int = COPY_CHUNK_ROWS, csv_engine: str = "pandas",
          copy_workers: int = 1, defer_indexes: bool = False):
-    if copy_workers <= 0:  # 0 = 자동: 코어 수만큼, 최대 8개
-        copy_workers = min(os.cpu_count() or 1, 8)
+    if copy_workers <= 0:
+        # 0 = 자동: .env의 COPY_WORKERS(tune.py 추천값)가 있으면 그 값, 없으면 코어 수만큼(최대 8개)
+        env_workers = int(os.getenv("COPY_WORKERS", "0") or 0)
+        copy_workers = env_workers if env_workers > 0 else min(os.cpu_count() or 1, 8)
     log.info(f"PostgreSQL 적재 중... (방식: {method}, CSV 변환: {csv_engine}, "
              f"연결 {copy_workers}개, 인덱스 나중에 생성: {defer_indexes})")
 
@@ -404,8 +406,9 @@ if __name__ == "__main__":
                         help="COPY를 나눠 보낼 행 수 (0 = 한 번에)")
     parser.add_argument("--csv-engine", choices=["pandas", "arrow"], default=os.getenv("CSV_ENGINE", "pandas"),
                         help="COPY 전에 CSV로 바꾸는 방법 (arrow가 훨씬 빠름)")
-    parser.add_argument("--copy-workers", type=int, default=int(os.getenv("COPY_WORKERS", "1")),
-                        help="동시에 COPY할 DB 연결 수 (0 = 자동: 코어 수, 최대 8)")
+    parser.add_argument("--copy-workers", type=int, default=int(os.getenv("COPY_WORKERS", "1") or 1),
+                        help="동시에 COPY할 DB 연결 수 (기본: .env의 COPY_WORKERS, 없으면 1 / "
+                             "0 = 자동: .env 값, 없으면 코어 수·최대 8)")
     parser.add_argument("--defer-indexes", action="store_true",
                         help="적재 전에 인덱스를 지우고 적재 후 다시 만들기")
     parser.add_argument("--metrics-out", default=None, help="측정 결과를 JSON으로 저장할 경로")

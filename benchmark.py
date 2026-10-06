@@ -46,7 +46,7 @@ STEPS = [
     (6, "+ Spark 사전 집계", "원본 행 대신 시간대·요일별 집계만 적재", ["--mode", "agg"], "spark_pipeline.py"),
     (7, "4단계 + Arrow CSV 변환", "pandas.to_csv → pyarrow CSV (C++)",
      ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "1"], "pipeline.py"),
-    (8, "+ 병렬 COPY", "DB 연결 여러 개로 동시에 COPY (자동: 코어 수, 최대 8)",
+    (8, "+ 병렬 COPY", "DB 연결 여러 개로 동시에 COPY (.env의 COPY_WORKERS, 없으면 코어 수·최대 8)",
      ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "0"], "pipeline.py"),
     (9, "+ 인덱스 나중에 생성", "적재 중엔 인덱스를 빼고 끝난 뒤 한 번에 생성",
      ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "0",
