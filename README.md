@@ -233,6 +233,7 @@ docker compose run --rm bench --step 0                         # 병목 해결 �
 
 docker compose --profile stream up -d consumer              # 스트리밍 consumer
 docker compose run --rm producer --year 2024 --month 1      # parquet → Kafka
+docker compose run --rm kafka-bench                         # 파티션 수 × consumer 수 처리량 실험
 ```
 
 - Kafka UI: http://localhost:8080

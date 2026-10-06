@@ -211,6 +211,27 @@ docker compose run --rm consumer --batch-size 10000 --exit-when-idle 15
 
 ### 실험 C — 파티션 수와 Consumer 수
 
+**자동 실험 (권장)**
+
+```bash
+docker compose run --rm kafka-bench                              # 기본 조합: 1x1, 3x1, 3x3, 3x4, 6x6
+docker compose run --rm kafka-bench --combos 1x1,2x2,4x4,8x8     # 원하는 조합 (파티션x컨슈머)
+docker compose run --rm kafka-bench --limit 1000000              # 메시지 수 늘리기
+```
+
+파티션 수마다 실험용 토픽을 새로 만들어 메시지를 넣고, consumer를 지정한 수만큼 동시에 띄워 토픽을 다 비울 때까지의 처리량을 잰다. 적재는 실험용 테이블(`bench_stream_trips`)에 하므로 `clean_taxi_trips`는 건드리지 않는다. 결과는 `data/benchmarks/kafka_partitions_*.md`로 저장된다.
+
+| 조합 | 확인할 것 |
+|---|---|
+| 1x1 → 3x1 | 파티션만 늘리고 consumer가 1개면 처리량이 거의 그대로다. **파티션은 병렬화의 '자리'일 뿐, 일할 consumer가 있어야 빨라진다.** |
+| 3x1 → 3x3 | consumer가 파티션을 하나씩 맡아 병렬로 처리한다. 몇 배가 되는지 확인 |
+| 3x3 → 3x4 | 4번째 consumer는 할당받을 파티션이 없어 논다(`일한 consumer 3/4`). **병렬성의 상한은 파티션 수다.** |
+| 3x3 → 6x6 | 더 늘려도 비례해서 빨라지지 않는 지점이 온다. CPU 수(결과 표 위쪽), DB 쓰기 경합, 파티션 편차 중 무엇이 원인인지 따져 보자 |
+
+**파티션 편차**: 메시지 키가 승차 지역 ID라서, 메시지가 몰리는 지역(공항, 맨해튼 중심부)이 있는 파티션은 다른 파티션보다 메시지가 많다. 결과 표의 `최대/평균` 값이 1보다 클수록 한 consumer에 일이 몰려 나머지가 먼저 끝나고 기다리게 된다. 처리 시간은 가장 바쁜 파티션이 결정한다.
+
+**수동으로 보기**
+
 ```bash
 docker compose --profile stream up -d --scale consumer=3
 docker compose run --rm producer

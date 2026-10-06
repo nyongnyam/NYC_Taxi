@@ -78,6 +78,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256 * 1024, help="파티션당 배치 최대 바이트")
     parser.add_argument("--compression", default="lz4", choices=["none", "gzip", "snappy", "lz4", "zstd"])
     parser.add_argument("--acks", default="all", choices=["0", "1", "all"])
+    parser.add_argument("--metrics-out", default=None, help="측정 결과를 JSON으로 저장할 경로")
     args = parser.parse_args()
 
     ensure_topic(config.KAFKA_BOOTSTRAP, config.KAFKA_TOPIC, args.partitions)
@@ -136,6 +137,10 @@ def main():
         f"전송 완료: {sent:,}건 / {elapsed:.1f}초 = {sent / elapsed:,.0f}건/초 "
         f"(실패 {failed:,}건, 큐 가득 참 {backpressure:,}회)"
     )
+    if args.metrics_out:
+        with open(args.metrics_out, "w", encoding="utf-8") as f:
+            json.dump({"sent": sent, "seconds": round(elapsed, 3), "failed": failed,
+                       "backpressure": backpressure}, f)
 
 
 if __name__ == "__main__":

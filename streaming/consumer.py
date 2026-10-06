@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--poll-timeout", type=float, default=1.0, help="묶음을 채우기 위해 기다리는 최대 초")
     parser.add_argument("--exit-when-idle", type=float, default=0,
                         help="N초 동안 메시지가 없으면 종료 (0 = 계속 실행)")
+    parser.add_argument("--metrics-out", default=None, help="종료 시 측정 결과를 JSON으로 저장할 경로")
     args = parser.parse_args()
 
     consumer = Consumer({
@@ -83,13 +84,22 @@ def main():
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,  # 오프셋은 DB 커밋 후 직접 커밋
     })
-    consumer.subscribe([config.KAFKA_TOPIC])
+    assigned_ever: set[int] = set()
+
+    def on_assign(_consumer, partitions):
+        # 리밸런싱 때마다 호출된다. 이 consumer가 어떤 파티션을 맡았는지 기록
+        ids = sorted(p.partition for p in partitions)
+        assigned_ever.update(ids)
+        log.info(f"파티션 할당: {ids if ids else '없음 (놀고 있는 consumer)'}")
+
+    consumer.subscribe([config.KAFKA_TOPIC], on_assign=on_assign)
     conn = psycopg2.connect(**config.psycopg2_kwargs())
 
     log.info(f"구독 시작: {config.KAFKA_TOPIC} (group={config.KAFKA_GROUP_ID}, batch={args.batch_size:,})")
     start = last_report = last_message = time.perf_counter()
-    consumed = loaded = 0
+    consumed = loaded = consumed_at_last_report = 0
     db_seconds = 0.0
+    first_ts = last_ts = None  # 실제로 메시지를 처리한 첫 시각 / 마지막 시각 (벽시계)
 
     try:
         while running:
@@ -105,29 +115,44 @@ def main():
                 values.append(m.value())
 
             if values:
+                if first_ts is None:
+                    first_ts = time.time()
                 t = time.perf_counter()
                 loaded += write_batch(conn, decode_batch(values))
                 db_seconds += time.perf_counter() - t
                 consumer.commit(asynchronous=False)
                 consumed += len(values)
                 last_message = now
+                last_ts = time.time()
             elif args.exit_when_idle and now - last_message >= args.exit_when_idle:
                 log.info(f"{args.exit_when_idle:.0f}초 동안 새 메시지 없음 → 종료")
                 break
 
-            if now - last_report >= 5 and consumed:
-                elapsed = now - start
-                log.info(
-                    f"  소비 {consumed:,}건 ({consumed / elapsed:,.0f}건/초) | 적재 {loaded:,}행 | "
-                    f"DB 시간 비중 {db_seconds / elapsed:.0%} | lag {total_lag(consumer)}"
-                )
+            if now - last_report >= 5:
+                recent = consumed - consumed_at_last_report
+                if recent:  # 새로 처리한 게 없으면(대기 중이면) 로그를 남기지 않는다
+                    log.info(
+                        f"  최근 5초 {recent / (now - last_report):,.0f}건/초 | 누적 소비 {consumed:,}건, "
+                        f"적재 {loaded:,}행 | DB 시간 비중 {db_seconds / (now - start):.0%} | "
+                        f"lag {total_lag(consumer)}"
+                    )
                 last_report = now
+                consumed_at_last_report = consumed
     finally:
         consumer.close()
         conn.close()
-        elapsed = time.perf_counter() - start
+        busy = (last_ts - first_ts) if first_ts and last_ts else 0
         if consumed:
-            log.info(f"종료: 소비 {consumed:,}건, 적재 {loaded:,}행, {elapsed:.1f}초")
+            log.info(f"종료: 소비 {consumed:,}건, 적재 {loaded:,}행, "
+                     f"처리 시간 {busy:.1f}초 ({consumed / busy if busy else 0:,.0f}건/초)")
+        if args.metrics_out:
+            with open(args.metrics_out, "w", encoding="utf-8") as f:
+                json.dump({
+                    "consumed": consumed, "loaded": loaded,
+                    "first_ts": first_ts, "last_ts": last_ts,
+                    "busy_seconds": round(busy, 3), "db_seconds": round(db_seconds, 3),
+                    "partitions": sorted(assigned_ever),
+                }, f)
 
 
 if __name__ == "__main__":
