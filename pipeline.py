@@ -1,21 +1,26 @@
 """
 pipeline.py — NYC Yellow Taxi 배치 ETL (Extract → Transform → Load)
 
-실행 예:
-    python pipeline.py --year 2024 --month 1
-    python pipeline.py --year 2024 --month 1 --load-method copy
-    python pipeline.py --year 2024 --month 1 --limit 200000   # 일부만 빠르게 실험
+기본값은 '최적화 전' 동작이다. 병목 해결 기법은 옵션으로 하나씩 켤 수 있어서
+같은 데이터로 전·후를 비교할 수 있다. 전체 비교는 benchmark.py가 자동으로 해 준다.
 
-각 단계가 끝날 때마다 소요 시간과 프로세스 최대 메모리(RSS)를 로그로 남겨
-어느 단계가 병목인지 바로 확인할 수 있다. (docs/BOTTLENECKS.md 참고)
+    python pipeline.py --year 2024 --month 1                      # 기존 방식 (캐싱 O, 전체 컬럼, multi INSERT)
+    python pipeline.py --no-cache                                 # 캐싱도 끈 '원래 병목' 상태
+    python pipeline.py --prune-columns                            # + 필요한 컬럼만 읽기
+    python pipeline.py --prune-columns --load-method copy         # + COPY 적재
+    python pipeline.py --limit 300000                             # 앞에서 N행만 (빠른 실험용)
+
+각 단계마다 소요 시간과 최대 메모리(RSS)를 로그로 남긴다. (docs/BOTTLENECKS.md 참고)
 """
 
 import argparse
 import io
+import json
 import logging
 import os
-import resource
+import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -63,6 +68,8 @@ TABLE_COLUMNS = [
     "tip_rate",
 ]
 
+COPY_CHUNK_ROWS = int(os.getenv("COPY_CHUNK_ROWS", "200000"))
+
 
 class DataNotPublished(Exception):
     """NYC TLC에 아직 공개되지 않은 월 (보통 2~3개월 딜레이)"""
@@ -70,56 +77,82 @@ class DataNotPublished(Exception):
 
 # ── 측정 도구 ────────────────────────────────────────
 def peak_memory_mb() -> float:
-    # Linux는 KB, macOS는 byte 단위로 반환
+    """이 프로세스가 지금까지 사용한 최대 메모리(MB)"""
+    if sys.platform == "win32":
+        import psutil  # Windows에는 resource 모듈이 없음
+        return psutil.Process().memory_info().peak_wset / (1024 * 1024)
+    import resource
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux는 KB, macOS는 byte 단위로 반환
     return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
 
 
 @contextmanager
-def stage(name: str, timings: dict):
+def stage(name: str, metrics: dict):
     start = time.perf_counter()
     yield
     elapsed = time.perf_counter() - start
-    timings[name] = elapsed
-    log.info(f"  ⏱ {name}: {elapsed:.1f}초 (최대 메모리 {peak_memory_mb():,.0f}MB)")
+    mem = peak_memory_mb()
+    metrics["stages"][name] = {"seconds": round(elapsed, 3), "peak_mb": round(mem)}
+    log.info(f"  ⏱ {name}: {elapsed:.1f}초 (최대 메모리 {mem:,.0f}MB)")
 
 
 # ── Extract ──────────────────────────────────────────
-def download(year: int, month: int) -> str:
-    """parquet 파일을 받아 로컬 경로를 반환. 이미 있으면 다운로드를 건너뛴다(캐싱)."""
-    os.makedirs(config.RAW_DIR, exist_ok=True)
-    filename   = f"yellow_tripdata_{year}-{month:02d}.parquet"
-    local_path = os.path.join(config.RAW_DIR, filename)
-
-    if os.path.exists(local_path):
-        log.info(f"  이미 존재, 다운로드 건너뜀: {local_path}")
-        return local_path
-
-    url = f"{config.BASE_URL}/{filename}"
-    log.info(f"다운로드 중: {url}")
-    tmp_path = local_path + ".part"
+def _fetch(url: str, dest: str):
+    """dest.part로 받은 뒤 끝까지 성공했을 때만 dest로 이름을 바꾼다."""
+    tmp_path = dest + ".part"
     try:
         urllib.request.urlretrieve(url, tmp_path)
     except urllib.error.HTTPError as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         if e.code in (403, 404):
-            raise DataNotPublished(f"{year}-{month:02d} 데이터가 아직 공개되지 않음") from e
+            raise DataNotPublished(f"{os.path.basename(dest)} 이(가) 아직 공개되지 않음") from e
         raise
-    # 다운로드가 끝까지 성공했을 때만 최종 이름으로 바꾼다.
-    # 중간에 끊기면 .part만 남으므로 깨진 파일이 캐시로 재사용되지 않는다.
-    os.replace(tmp_path, local_path)
+    os.replace(tmp_path, dest)
+
+
+def download(year: int, month: int, use_cache: bool = True) -> str:
+    """parquet 파일 경로를 반환한다.
+
+    use_cache=True : data/raw/에 있으면 다운로드를 건너뛴다 (병목 해결 ①)
+    use_cache=False: 매번 임시 폴더에 새로 받는다 (캐싱 도입 전 상태 재현)
+    """
+    filename = f"yellow_tripdata_{year}-{month:02d}.parquet"
+    url = f"{config.BASE_URL}/{filename}"
+
+    if not use_cache:
+        tmp_dir = tempfile.mkdtemp(prefix="nyctaxi_nocache_")
+        local_path = os.path.join(tmp_dir, filename)
+        log.info(f"다운로드 중 (캐시 미사용): {url}")
+        _fetch(url, local_path)
+        return local_path
+
+    os.makedirs(config.RAW_DIR, exist_ok=True)
+    local_path = os.path.join(config.RAW_DIR, filename)
+    if os.path.exists(local_path):
+        log.info(f"  이미 존재, 다운로드 건너뜀: {local_path}")
+        return local_path
+
+    log.info(f"다운로드 중: {url}")
+    _fetch(url, local_path)
     log.info(f"  저장 완료: {local_path}")
     return local_path
 
 
-def extract(year: int, month: int, limit: int | None = None) -> pd.DataFrame:
-    local_path = download(year, month)
+def extract(year: int, month: int, limit: int | None = None,
+            use_cache: bool = True, prune_columns: bool = False) -> pd.DataFrame:
+    local_path = download(year, month, use_cache)
 
-    # 필요한 컬럼만 읽는다 (parquet은 컬럼 단위 저장이라 나머지는 디스크에서 읽지도 않음)
-    schema  = pq.read_schema(local_path)
-    columns = [name for name in schema.names if name.lower() in RAW_COLUMNS]
+    columns = None
+    if prune_columns:
+        # parquet은 컬럼 단위로 저장되므로, 지정하지 않은 컬럼은 디스크에서 읽지도 않는다 (병목 해결 ②)
+        schema  = pq.read_schema(local_path)
+        columns = [name for name in schema.names if name.lower() in RAW_COLUMNS]
     df = pd.read_parquet(local_path, columns=columns)
+
+    if not use_cache:
+        shutil.rmtree(os.path.dirname(local_path), ignore_errors=True)
 
     if limit:
         df = df.head(limit)
@@ -156,6 +189,7 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     # 비정상 운행 제거
     df = df[df["trip_duration_min"].between(1, 180)]
 
+    # 테이블에 있는 컬럼만 남긴다 (원본 19개 컬럼을 그대로 넣으면 적재가 실패함)
     return df[TABLE_COLUMNS]
 
 
@@ -173,26 +207,26 @@ def transform(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
 
 
 # ── Load ─────────────────────────────────────────────
-COPY_CHUNK_ROWS = int(os.getenv("COPY_CHUNK_ROWS", "200000"))
-
-
 def copy_dataframe(dbapi_conn, df: pd.DataFrame, table: str = config.TABLE_NAME,
                    chunk_rows: int = COPY_CHUNK_ROWS):
-    """PostgreSQL COPY로 DataFrame을 밀어 넣는다 (INSERT보다 훨씬 빠름).
+    """PostgreSQL COPY로 DataFrame을 밀어 넣는다 (병목 해결 ③).
 
-    전체를 한 번에 CSV 문자열로 만들면 그 문자열만큼 메모리가 더 필요하므로
-    chunk_rows 단위로 나눠 보낸다. 같은 트랜잭션 안이라 원자성은 그대로 유지된다.
+    chunk_rows > 0 이면 그 단위로 나눠 보내 CSV 버퍼 메모리를 줄인다 (병목 해결 ④).
+    chunk_rows = 0 이면 전체를 한 번에 CSV로 만든다.
+    같은 트랜잭션 안이라 나눠 보내도 원자성은 유지된다.
     """
     sql = f'COPY "{table}" ({", ".join(df.columns)}) FROM STDIN WITH (FORMAT csv)'
+    step = chunk_rows if chunk_rows > 0 else max(len(df), 1)
     with dbapi_conn.cursor() as cur:
-        for start in range(0, len(df), chunk_rows):
+        for start in range(0, len(df), step):
             buf = io.StringIO()
-            df.iloc[start:start + chunk_rows].to_csv(buf, index=False, header=False)
+            df.iloc[start:start + step].to_csv(buf, index=False, header=False)
             buf.seek(0)
             cur.copy_expert(sql, buf)
 
 
-def load(df: pd.DataFrame, year: int, month: int, method: str = "multi"):
+def load(df: pd.DataFrame, year: int, month: int, method: str = "multi",
+         chunk_rows: int = COPY_CHUNK_ROWS):
     log.info(f"PostgreSQL 적재 중... (방식: {method})")
     start = f"{year}-{month:02d}-01"
     end   = f"{year + (month == 12)}-{month % 12 + 1:02d}-01"
@@ -210,8 +244,10 @@ def load(df: pd.DataFrame, year: int, month: int, method: str = "multi"):
                 log.info(f"  기존 {year}-{month:02d} 데이터 {deleted:,}행 삭제")
 
         if method == "copy":
-            copy_dataframe(conn.connection, df)
+            copy_dataframe(conn.connection, df, chunk_rows=chunk_rows)
         else:
+            # multi : 기존 방식 — 5만 행씩 다중 행 INSERT
+            # single: chunksize 없이 executemany — 메모리 병목 재현용
             df.to_sql(
                 config.TABLE_NAME,
                 conn,
@@ -225,36 +261,62 @@ def load(df: pd.DataFrame, year: int, month: int, method: str = "multi"):
 
 # ── Run ──────────────────────────────────────────────
 def run(year: int = 2024, month: int = 1, load_method: str = "multi",
-        limit: int | None = None) -> int:
+        limit: int | None = None, use_cache: bool = True, prune_columns: bool = False,
+        copy_chunk_rows: int = COPY_CHUNK_ROWS) -> dict:
     log.info(f"파이프라인 시작: {year}-{month:02d}")
-    timings: dict[str, float] = {}
+    metrics = {
+        "options": {
+            "year": year, "month": month, "limit": limit, "use_cache": use_cache,
+            "prune_columns": prune_columns, "load_method": load_method,
+            "copy_chunk_rows": copy_chunk_rows if load_method == "copy" else None,
+        },
+        "stages": {},
+    }
 
-    with stage("extract", timings):
-        raw = extract(year, month, limit)
-    with stage("transform", timings):
+    with stage("extract", metrics):
+        raw = extract(year, month, limit, use_cache, prune_columns)
+    with stage("transform", metrics):
         cleaned = transform(raw, year, month)
     del raw  # 원본 DataFrame 메모리 해제
-    with stage(f"load({load_method})", timings):
-        load(cleaned, year, month, method=load_method)
+    with stage("load", metrics):
+        load(cleaned, year, month, method=load_method, chunk_rows=copy_chunk_rows)
 
-    total = sum(timings.values())
-    summary = " | ".join(f"{k} {v:.1f}s ({v / total:.0%})" for k, v in timings.items())
-    log.info(f"파이프라인 완료: 총 {total:.1f}초 — {summary}")
-    return len(cleaned)
+    total = sum(s["seconds"] for s in metrics["stages"].values())
+    metrics["total_seconds"] = round(total, 3)
+    metrics["peak_mb"] = round(peak_memory_mb())
+    metrics["rows_loaded"] = len(cleaned)
+
+    summary = " | ".join(
+        f"{k} {v['seconds']:.1f}s ({v['seconds'] / total:.0%})" for k, v in metrics["stages"].items()
+    )
+    log.info(f"파이프라인 완료: 총 {total:.1f}초, 최대 메모리 {metrics['peak_mb']:,}MB — {summary}")
+    return metrics
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NYC Yellow Taxi 배치 ETL")
     parser.add_argument("--year",  type=int, default=2024)
     parser.add_argument("--month", type=int, default=1, choices=range(1, 13))
-    parser.add_argument("--load-method", default="multi",
-                        choices=["single", "multi", "copy"],
-                        help="single: 행 단위 INSERT / multi: 다중 행 INSERT(기존 방식) / copy: COPY")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="앞에서부터 N행만 처리 (빠른 실험용)")
+    parser.add_argument("--limit", type=int, default=None, help="앞에서부터 N행만 처리 (빠른 실험용)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="다운로드 캐시를 쓰지 않고 매번 새로 받기 (캐싱 도입 전 상태)")
+    parser.add_argument("--prune-columns", action="store_true",
+                        help="필요한 8개 컬럼만 읽기")
+    parser.add_argument("--load-method", default="multi", choices=["single", "multi", "copy"],
+                        help="multi: 기존 방식(다중 행 INSERT) / copy: COPY / single: chunksize 없는 INSERT")
+    parser.add_argument("--copy-chunk-rows", type=int, default=COPY_CHUNK_ROWS,
+                        help="COPY를 나눠 보낼 행 수 (0 = 한 번에)")
+    parser.add_argument("--metrics-out", default=None, help="측정 결과를 JSON으로 저장할 경로")
     args = parser.parse_args()
 
     try:
-        run(args.year, args.month, args.load_method, args.limit)
+        result = run(args.year, args.month, args.load_method, args.limit,
+                     use_cache=not args.no_cache, prune_columns=args.prune_columns,
+                     copy_chunk_rows=args.copy_chunk_rows)
     except DataNotPublished as e:
         log.warning(f"건너뜀: {e}")
+        sys.exit(0)
+
+    if args.metrics_out:
+        with open(args.metrics_out, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)

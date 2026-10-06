@@ -77,10 +77,11 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ### 3.3 데이터 적재
 
-정제된 DataFrame을 PostgreSQL에 적재한다. 적재 방식은 `--load-method`로 고를 수 있다.
+정제된 DataFrame을 PostgreSQL에 적재한다. 기본값은 기존 방식(`multi`)이고, 병목 해결 기법은 옵션으로 켠다.
 
-- `copy`(권장): PostgreSQL `COPY`로 20만 행씩 스트리밍 — 한 달 치 약 28초
 - `multi`(기존 방식): `to_sql(method="multi", chunksize=50000)` — 한 달 치 10분 이상
+- `copy`: PostgreSQL `COPY`로 20만 행씩 전송 — 한 달 치 약 28초
+- `benchmark.py`로 기존 코드 대비 기법별 감소율(시간·메모리)을 한 번에 측정할 수 있다 (30만 행 기준 총 시간 94.9% 감소)
 - 같은 월을 다시 실행하면 해당 월을 먼저 삭제한 뒤 적재(멱등성)해 중복이 생기지 않음
 - 접속 정보는 `.env`(환경 변수)로 관리
 
@@ -227,7 +228,8 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 ```bash
 cp .env.example .env
 docker compose up -d                                        # PostgreSQL + Kafka + Kafka UI
-docker compose run --rm pipeline --year 2024 --month 1 --load-method copy   # 배치 ETL
+docker compose run --rm pipeline --year 2024 --month 1        # 배치 ETL (기존 방식)
+docker compose run --rm bench                                  # 병목 해결 전·후 비교
 
 docker compose --profile stream up -d consumer              # 스트리밍 consumer
 docker compose run --rm producer --year 2024 --month 1      # parquet → Kafka
@@ -244,7 +246,9 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env                       # DB 접속 정보 수정
 psql -U postgres -d nyctaxi -f sql/setup.sql
-python pipeline.py --year 2024 --month 1 --load-method copy
+python pipeline.py --year 2024 --month 1                                   # 기존 방식
+python pipeline.py --year 2024 --month 1 --prune-columns --load-method copy  # 최적화 적용
+python benchmark.py                                                       # 전·후 비교
 python monitoring/health_check.py
 ```
 

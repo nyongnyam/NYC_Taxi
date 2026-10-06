@@ -66,7 +66,7 @@ def task_transform_load(**context):
     year, month = _target_month(context)
     start = time.time()
     try:
-        cleaned = transform(extract(year, month), year, month)
+        cleaned = transform(extract(year, month, prune_columns=True), year, month)
         load(cleaned, year, month, method=os.getenv("LOAD_METHOD", "copy"))
         duration = round(time.time() - start, 1)
 

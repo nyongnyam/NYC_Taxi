@@ -1,7 +1,8 @@
 # 로컬 실험 환경: PostgreSQL + Kafka(KRaft, 단일 브로커) + Kafka UI + 파이프라인 컨테이너
 #
 #   docker compose up -d                                   # 인프라만 기동 (DB, Kafka, UI)
-#   docker compose run --rm pipeline --year 2024 --month 1 --load-method copy   # 배치 ETL
+#   docker compose run --rm pipeline --year 2024 --month 1        # 배치 ETL (기존 방식)
+#   docker compose run --rm bench                                  # 병목 해결 전·후 비교 (결과: data/benchmarks/)
 #   docker compose --profile stream up -d consumer         # 스트리밍 consumer 기동
 #   docker compose run --rm producer --limit 500000        # parquet → Kafka 재생
 #   docker compose --profile stream up -d --scale consumer=3   # consumer 수평 확장
@@ -83,6 +84,15 @@ services:
     profiles: ["batch"]
     entrypoint: ["python", "pipeline.py"]
     command: ["--year", "2024", "--month", "1"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bench:
+    <<: *app
+    profiles: ["batch"]
+    entrypoint: ["python", "benchmark.py"]
+    command: []
     depends_on:
       db:
         condition: service_healthy

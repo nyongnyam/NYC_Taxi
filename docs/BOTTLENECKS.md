@@ -7,15 +7,58 @@
 
 ---
 
-## 0. 측정하는 법
+## 0. 한 번에 비교하기 — benchmark.py
+
+`pipeline.py`의 기본값은 **최적화 전 동작**(전체 컬럼 읽기 + 다중 행 INSERT)이고, 병목 해결 기법은 옵션으로 하나씩 켠다. `benchmark.py`는 기존 코드를 기준으로 기법을 하나씩 추가하며 각 단계를 별도 프로세스로 실행하고, **기준 대비 몇 % 줄었는지** 표로 정리해 준다.
+
+```bash
+python benchmark.py                    # 30만 행, 0~4단계 (몇 분)
+python benchmark.py --full             # 한 달 전체 (0~2단계는 각각 10분 이상)
+python benchmark.py --repeat 3         # 단계마다 3번 실행해 중앙값 사용
+
+# Docker
+docker compose run --rm bench
+docker compose run --rm bench --limit 1000000 --repeat 3
+```
+
+| 단계 | 새로 적용하는 기법 | `pipeline.py` 옵션 |
+|---|---|---|
+| 0 | 기존 코드 (기준) | `--no-cache --load-method multi` |
+| 1 | 다운로드 캐싱 | `--load-method multi` |
+| 2 | 컬럼 프루닝 | `--prune-columns --load-method multi` |
+| 3 | COPY 적재 | `--prune-columns --load-method copy --copy-chunk-rows 0` |
+| 4 | 청크 COPY | `--prune-columns --load-method copy` |
+
+결과는 화면에 출력되고 `data/benchmarks/bench_날짜.md`, `.csv`로 저장된다.
+
+### 1차 측정 결과 (30만 행)
+
+| 단계 | 총 시간 | 기준 대비 | 직전 단계 대비 | 최대 메모리 | 기준 대비 |
+|---|---|---|---|---|---|
+| [0] 기존 코드 | 77.2초 | 기준 | - | 1,675MB | 기준 |
+| [1] + 다운로드 캐싱 | 69.7초 | 9.7% 감소 | 9.7% 감소 | 1,664MB | 0.7% 감소 |
+| [2] + 컬럼 프루닝 | 68.9초 | 10.7% 감소 | 1.1% 감소 | 1,187MB | 29.1% 감소 |
+| [3] + COPY 적재 | 4.0초 | **94.9% 감소** | 94.2% 감소 | 739MB | 55.9% 감소 |
+| [4] + 청크 COPY | 4.0초 | 94.8% 감소 | 변화 거의 없음 | 697MB | **58.4% 감소** |
+
+읽는 법:
+
+- **캐싱**은 이 측정에서 다운로드가 로컬 서버라 5초 정도만 줄었다. 실제 인터넷(NYC TLC 서버)에서는 다운로드 시간이 훨씬 길어서 감소율이 커진다. 본인 환경에서 꼭 다시 재 보자.
+- **컬럼 프루닝**은 시간보다 **메모리**를 줄이는 기법이다 (-29%).
+- **COPY**가 시간 병목의 본체를 해결한다. 적재 구간이 69초에서 3.5초로 줄었다.
+- **청크 COPY**는 30만 행에서는 두 번만 나눠 보내서 효과가 작다. 한 달 전체(271만 행)에서는 최대 메모리가 1,988MB에서 1,233MB로 **38% 줄어든다**(아래 2장). 데이터가 커질수록 차이가 커지는 기법이라 `--full`로 비교해 보자.
+
+---
+
+## 0-1. 단계별 로그 읽는 법
 
 `pipeline.py`는 단계마다 소요 시간과 그 시점까지의 최대 메모리를 남긴다.
 
 ```
 ⏱ extract: 0.2초 (최대 메모리 520MB)
 ⏱ transform: 1.5초 (최대 메모리 1,243MB)
-⏱ load(copy): 28.5초 (최대 메모리 1,233MB)
-파이프라인 완료: 총 30.2초 — extract 0.2s (1%) | transform 1.5s (5%) | load(copy) 28.5s (94%)
+⏱ load: 28.5초 (최대 메모리 1,233MB)
+파이프라인 완료: 총 30.2초, 최대 메모리 1,233MB — extract 0.2s (1%) | transform 1.5s (5%) | load 28.5s (94%)
 ```
 
 먼저 **비율**을 본다. 위 결과는 시간의 94%가 적재에서 쓰인다는 뜻이고, 정제(transform)를 아무리 최적화해도 전체는 5%밖에 빨라지지 않는다. 병목 분석은 항상 "가장 큰 덩어리부터"다.
@@ -55,9 +98,9 @@ python -m cProfile -s tottime pipeline.py --limit 50000 --load-method multi | he
 | `copy` — 20만 행씩 나눠 COPY (현재 기본값) | — | **28.5초** | **1,233MB** |
 
 ```bash
-python pipeline.py --limit 300000 --load-method multi
-python pipeline.py --limit 300000 --load-method single
-python pipeline.py --limit 300000 --load-method copy
+python pipeline.py --prune-columns --limit 300000 --load-method multi
+python pipeline.py --prune-columns --limit 300000 --load-method single
+python pipeline.py --prune-columns --limit 300000 --load-method copy
 ```
 
 ### 왜 `multi`가 느린가 — 프로파일 결과
@@ -84,8 +127,8 @@ COPY는 파라미터를 하나하나 바인딩하지 않고 CSV 스트림을 그
 한 번에 COPY하면 271만 행짜리 CSV 문자열(수백 MB)이 DataFrame과 별도로 메모리에 올라간다. 20만 행씩 나누면 그 버퍼가 작아져 **속도는 같고 최대 메모리는 약 750MB 줄어든다**. 같은 트랜잭션 안에서 나눠 보내므로 중간에 실패해도 전부 롤백된다.
 
 ```bash
-COPY_CHUNK_ROWS=100000000 python pipeline.py --load-method copy   # 사실상 한 번에
-COPY_CHUNK_ROWS=50000     python pipeline.py --load-method copy   # 더 잘게
+python pipeline.py --prune-columns --load-method copy --copy-chunk-rows 0       # 한 번에
+python pipeline.py --prune-columns --load-method copy --copy-chunk-rows 50000   # 더 잘게
 ```
 
 ---
@@ -99,7 +142,7 @@ COPY_CHUNK_ROWS=50000     python pipeline.py --load-method copy   # 더 잘게
 | 전체 읽기 | 19 | 0.39초 | 418MB | 993MB |
 | 필요한 컬럼만 | 8 | 0.23초 | 178MB | 520MB |
 
-`extract()`에서 `pd.read_parquet(path, columns=...)`로 적용했다.
+`--prune-columns` 옵션을 켜면 `extract()`가 `pd.read_parquet(path, columns=...)`로 필요한 컬럼만 읽는다.
 
 ---
 
@@ -195,8 +238,9 @@ FROM clean_taxi_trips;
 클라우드의 작은 인스턴스(1~2GB)를 흉내 내려면 컨테이너 메모리를 제한해 보면 된다.
 
 ```bash
-APP_MEM_LIMIT=1g docker compose run --rm pipeline --load-method copy
+APP_MEM_LIMIT=1g docker compose run --rm pipeline --prune-columns --load-method copy
 APP_MEM_LIMIT=1g docker compose run --rm pipeline --load-method single
+APP_MEM_LIMIT=1g docker compose run --rm bench --full
 ```
 
 어떤 방식이 살아남고 어떤 방식이 OOM으로 죽는지 확인하면, 클라우드 인스턴스 크기를 근거 있게 고를 수 있다.
