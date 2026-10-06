@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 다운로드 캐시
+data/raw/*.parquet
+data/raw/*.part
+
+monitoring/pipeline.log

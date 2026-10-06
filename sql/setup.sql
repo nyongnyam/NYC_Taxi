@@ -1,5 +1,6 @@
 -- setup.sql — 테이블 및 분석 뷰 생성
--- 실행: psql -U hyukjunc -d nyctaxi -f sql/setup.sql
+-- 실행: psql -h localhost -U postgres -d nyctaxi -f sql/setup.sql
+-- (docker compose 사용 시 Postgres 컨테이너가 처음 뜰 때 자동 실행됨)
 
 -- 정제 결과 테이블
 CREATE TABLE IF NOT EXISTS clean_taxi_trips (

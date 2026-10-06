@@ -3,6 +3,8 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
 ![Tableau](https://img.shields.io/badge/Tableau-E97627?style=for-the-badge&logo=tableau&logoColor=white)
 ![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white)
+![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 
 # 뉴욕 택시 운행 기록을 사용한 택시 운전 기사 수익 최적화 대시보드
 
@@ -35,6 +37,8 @@
 - **데이터 정제**: Python `Pandas` 라이브러리를 통해 이상값 제거, 파생 칼럼 생성
 - **데이터 적재**: Python `SQLAlchemy` 라이브러리를 활용해 정제 결과를 로컬 PostgreSQL에 적재
 - **시각화**: Tableau Desktop을 이용해 BI 대시보드 구성
+- **스트리밍(실험)**: Apache Kafka — parquet을 운행 이벤트로 재생해 Producer → 토픽 → Consumer → PostgreSQL 경로로 적재
+- **실행 환경**: Docker Compose — PostgreSQL, Kafka, Kafka UI, 파이프라인 컨테이너를 한 번에 구성
 - **버전 관리**: Git을 통한 코드 및 Tableau 워크북 관리
 
 ## 3. ETL 파이프라인 상세
@@ -73,11 +77,14 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ### 3.3 데이터 적재
 
-정제된 DataFrame을 SQLAlchemy의 `to_sql()` 메서드를 통해 로컬 PostgreSQL에 적재한다.
+정제된 DataFrame을 PostgreSQL에 적재한다. 적재 방식은 `--load-method`로 고를 수 있다.
 
-- `append` 방식을 사용해 기존 데이터를 유지하며 새 데이터 추가
-- `chunksize`: 50000
-- 연결 방식: `postgresql://username@localhost:5432/nyctaxi`
+- `copy`(권장): PostgreSQL `COPY`로 20만 행씩 스트리밍 — 한 달 치 약 28초
+- `multi`(기존 방식): `to_sql(method="multi", chunksize=50000)` — 한 달 치 10분 이상
+- 같은 월을 다시 실행하면 해당 월을 먼저 삭제한 뒤 적재(멱등성)해 중복이 생기지 않음
+- 접속 정보는 `.env`(환경 변수)로 관리
+
+방식별 측정 결과와 원인 분석은 [docs/BOTTLENECKS.md](docs/BOTTLENECKS.md)에 정리했다.
 
 ## 4. Airflow 자동화
 
@@ -94,6 +101,13 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 - 스케줄: `0 6 1 * *` (매월 1일 오전 6시)
 - 전달 데이터 자동 수집: `datetime.now() - relativedelta(months=1)`
 - 실행 환경: `airflow standalone` — 웹 서버 + 스케줄러를 단일 명령으로 통합 실행
+
+### 4.3 Kafka 스트리밍 경로 (실험)
+
+배치 ETL과 별도로, 같은 데이터를 실시간 이벤트처럼 흘려보내는 경로를 구성했다.
+
+- `streaming/producer.py`: parquet을 5만 행씩 읽어 운행 1건 = 메시지 1건(JSON)으로 전송. 키는 승차 지역 ID
+- `streaming/consumer.py`: 1만 건 단위로 꺼내 배치와 같은 규칙으로 정제 후 COPY. DB 커밋 후에만 오프셋 커밋(at-least-once)
 
 ## 5. 데이터베이스 구조
 
@@ -205,3 +219,35 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 - 집중 운행: 10-12월의 연말 시즌 (수익 증가율 최고)
 - 비용 절감: 1-2월 연초 비수기
+
+## 8. 실행 방법
+
+### Docker Compose (권장)
+
+```bash
+cp .env.example .env
+docker compose up -d                                        # PostgreSQL + Kafka + Kafka UI
+docker compose run --rm pipeline --year 2024 --month 1 --load-method copy   # 배치 ETL
+
+docker compose --profile stream up -d consumer              # 스트리밍 consumer
+docker compose run --rm producer --year 2024 --month 1      # parquet → Kafka
+```
+
+- Kafka UI: http://localhost:8080
+- Tableau 연결: `localhost:5432` / DB `nyctaxi` / `postgres` (비밀번호는 `.env`)
+- 로컬에 이미 PostgreSQL이 5432를 쓰고 있으면 `.env`에서 `PG_PORT=5433`으로 바꾼다
+
+### 로컬 Python
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env                       # DB 접속 정보 수정
+psql -U postgres -d nyctaxi -f sql/setup.sql
+python pipeline.py --year 2024 --month 1 --load-method copy
+python monitoring/health_check.py
+```
+
+### Airflow
+
+`dags/nyc_taxi_dag.py`를 `~/airflow/dags/`에 심볼릭 링크로 연결하고, 프로젝트 경로가 다르면 `NYC_TAXI_PROJECT_DIR` 환경 변수로 지정한다. Airflow 2.x와 3.x 모두에서 동작한다.
