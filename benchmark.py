@@ -31,16 +31,29 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(BASE_DIR, "data", "benchmarks")
 
 # (단계 번호, 이름, 이 단계에서 새로 적용한 기법, 실행 옵션, 실행할 스크립트)
+PANDAS_BASE = ["--csv-engine", "pandas", "--copy-workers", "1"]  # .env 설정과 상관없이 0~4단계 조건을 고정
+
 STEPS = [
-    (0, "기존 코드 (기준)", "-", ["--no-cache", "--load-method", "multi"], "pipeline.py"),
-    (1, "+ 다운로드 캐싱", "이미 받은 parquet 재사용", ["--load-method", "multi"], "pipeline.py"),
-    (2, "+ 컬럼 프루닝", "19개 중 필요한 8개 컬럼만 읽기", ["--prune-columns", "--load-method", "multi"], "pipeline.py"),
+    (0, "기존 코드 (기준)", "-", ["--no-cache", "--load-method", "multi", *PANDAS_BASE], "pipeline.py"),
+    (1, "+ 다운로드 캐싱", "이미 받은 parquet 재사용", ["--load-method", "multi", *PANDAS_BASE], "pipeline.py"),
+    (2, "+ 컬럼 프루닝", "19개 중 필요한 8개 컬럼만 읽기",
+     ["--prune-columns", "--load-method", "multi", *PANDAS_BASE], "pipeline.py"),
     (3, "+ COPY 적재", "다중 행 INSERT → PostgreSQL COPY",
-     ["--prune-columns", "--load-method", "copy", "--copy-chunk-rows", "0"], "pipeline.py"),
-    (4, "+ 청크 COPY", "COPY를 20만 행씩 나눠 전송", ["--prune-columns", "--load-method", "copy"], "pipeline.py"),
+     ["--prune-columns", "--load-method", "copy", "--copy-chunk-rows", "0", *PANDAS_BASE], "pipeline.py"),
+    (4, "+ 청크 COPY", "COPY를 20만 행씩 나눠 전송",
+     ["--prune-columns", "--load-method", "copy", *PANDAS_BASE], "pipeline.py"),
     (5, "+ Spark 분산 처리", "pandas → Spark(코어 수만큼 파티션 병렬 처리·COPY)", ["--mode", "raw"], "spark_pipeline.py"),
     (6, "+ Spark 사전 집계", "원본 행 대신 시간대·요일별 집계만 적재", ["--mode", "agg"], "spark_pipeline.py"),
+    (7, "4단계 + Arrow CSV 변환", "pandas.to_csv → pyarrow CSV (C++)",
+     ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "1"], "pipeline.py"),
+    (8, "+ 병렬 COPY", "DB 연결 여러 개로 동시에 COPY (자동: 코어 수, 최대 8)",
+     ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "0"], "pipeline.py"),
+    (9, "+ 인덱스 나중에 생성", "적재 중엔 인덱스를 빼고 끝난 뒤 한 번에 생성",
+     ["--prune-columns", "--load-method", "copy", "--csv-engine", "arrow", "--copy-workers", "0",
+      "--defer-indexes"], "pipeline.py"),
 ]
+# '직전 단계 대비'를 계산할 때 비교할 단계 (7단계는 Spark가 아니라 4단계에서 이어진다)
+PARENT = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 4, 8: 7, 9: 8}
 STAGE_ORDER = ["startup", "extract", "transform", "load", "process"]
 
 
@@ -111,7 +124,7 @@ def main():
                         help="측정할 월. 하나(1), 범위(1-6) — 여러 달이면 규모 실험")
     parser.add_argument("--limit", type=int, default=300_000, help="처리할 행 수 (기본 30만)")
     parser.add_argument("--full", action="store_true", help="한 달 전체 데이터로 측정")
-    parser.add_argument("--step", "--steps", dest="steps", default="0,1,2,3,4,5,6",
+    parser.add_argument("--step", "--steps", dest="steps", default="0,1,2,3,4,5,6,7,8,9",
                         help="실행할 단계 번호. 하나만(--step 2) 또는 여러 개(--steps 0,3)")
     parser.add_argument("--repeat", type=int, default=1, help="단계마다 반복 횟수 (중앙값 사용)")
     parser.add_argument("--timeout", type=int, default=1800, help="단계별 최대 실행 시간(초)")
@@ -188,7 +201,7 @@ def main():
         "|---|---|---|---|---|---|---|---|---|",
     ]
     csv_rows = []
-    prev = None
+    ok_by_num = {row["num"]: row["result"] for row in ok_rows}
     for row in rows:
         r = row["result"]
         mark = " ★" if row["num"] in just_ran else ""
@@ -201,10 +214,13 @@ def main():
         slowest = max(st, key=lambda k: st[k]["seconds"])
         share = st[slowest]["seconds"] / r["total_seconds"] if r["total_seconds"] else 0
         is_base = row is base_row
+        parent = PARENT.get(row["num"])
+        prev = ok_by_num.get(parent)
+        prev_text = f"{pct_change(r['total_seconds'], prev['total_seconds'])} (vs [{parent}])" if prev else "-"
         lines.append(
             f"| {label} | {row['technique']} | {r['total_seconds']:.1f}초 "
             f"| {'기준' if is_base else pct_change(r['total_seconds'], base['total_seconds'])} "
-            f"| {pct_change(r['total_seconds'], prev['total_seconds']) if prev else '-'} "
+            f"| {prev_text} "
             f"| {r['peak_mb']:,}MB "
             f"| {'기준' if is_base else pct_change(r['peak_mb'], base['peak_mb'])} "
             f"| {slowest} ({share:.0%}) | {r.get('measured_at', '')} |"
@@ -215,7 +231,6 @@ def main():
             **{f"{k}_s": st[k]["seconds"] for k in STAGE_ORDER if k in st},
             "rows_loaded": r["rows_loaded"],
         })
-        prev = r
 
     used = [k for k in STAGE_ORDER if any(k in row["result"]["stages"] for row in ok_rows)]
     lines += ["", "## 구간별 시간 (초)", "",
@@ -225,7 +240,7 @@ def main():
         st = row["result"]["stages"]
         cells = " | ".join(f"{st[k]['seconds']:.1f}" if k in st else "-" for k in used)
         lines.append(f"| [{row['num']}] {row['name']} | {cells} | {row['result']['rows_loaded']:,} |")
-    if any(row["num"] >= 5 for row in ok_rows):
+    if any(row["num"] in (5, 6) for row in ok_rows):
         lines += ["", "Spark는 지연 실행이라 읽기·정제·적재가 `process` 구간에서 한꺼번에 실행된다. "
                   "`startup`은 Spark 세션(JVM) 준비 시간. 6단계의 적재 행 수는 원본이 아니라 집계 결과 행 수다."]
 

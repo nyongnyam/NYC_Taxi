@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py metrics.py pipeline.py spark_pipeline.py benchmark.py ./
+COPY config.py metrics.py pipeline.py spark_pipeline.py benchmark.py tune.py ./
 COPY sql/ ./sql/
 COPY streaming/ ./streaming/
 COPY monitoring/health_check.py ./monitoring/

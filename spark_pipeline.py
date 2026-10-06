@@ -108,8 +108,16 @@ def _connect():
     return psycopg2.connect(**config.psycopg2_kwargs())
 
 
-def load_raw(df, year: int, months: list[int], partitions: int) -> int:
-    """파티션마다 DB 연결을 열어 COPY를 병렬로 보낸다."""
+def load_raw(df, year: int, months: list[int], partitions: int, defer_indexes: bool = False) -> int:
+    """파티션마다 DB 연결을 열어 COPY를 병렬로 보낸다.
+
+    Spark → 파이썬 워커로 넘길 때 pandas를 거치지 않고 Arrow 배치를 그대로 받아(mapInArrow)
+    pyarrow로 바로 CSV를 만든다. pandas.to_csv보다 몇 배 빠르다.
+    """
+    from sqlalchemy import create_engine
+
+    from pipeline import drop_indexes
+
     deleted = 0
     with _connect() as conn, conn.cursor() as cur:
         for start, end in month_ranges(year, months):
@@ -119,6 +127,11 @@ def load_raw(df, year: int, months: list[int], partitions: int) -> int:
     if deleted:
         log.info(f"  기존 데이터 {deleted:,}행 삭제")
 
+    index_defs = []
+    if defer_indexes:
+        with create_engine(config.DB_URL).begin() as conn:
+            index_defs = drop_indexes(conn)
+
     conn_kwargs = config.psycopg2_kwargs()
     table = config.TABLE_NAME
     copy_sql = f'COPY "{table}" ({", ".join(TABLE_COLUMNS)}) FROM STDIN WITH (FORMAT csv)'
@@ -127,29 +140,43 @@ def load_raw(df, year: int, months: list[int], partitions: int) -> int:
         # 이 함수는 Spark 워커 프로세스 안에서 파티션마다 한 번 실행된다
         import io
 
-        import pandas as pd
         import psycopg2 as pg
+        import pyarrow as pa
+        import pyarrow.csv as pacsv
 
         conn = pg.connect(**conn_kwargs)
         written = 0
         try:
             with conn.cursor() as cur:
-                for pdf in batches:
-                    if pdf.empty:
+                for batch in batches:
+                    if batch.num_rows == 0:
                         continue
-                    buf = io.StringIO()
-                    pdf.to_csv(buf, index=False, header=False)
+                    # 시간 컬럼의 시간대 표시(UTC)를 떼어 PostgreSQL TIMESTAMP 형식으로 맞춘다
+                    cols = [c.cast(pa.timestamp("us")) if pa.types.is_timestamp(c.type) else c
+                            for c in batch.columns]
+                    buf = io.BytesIO()
+                    pacsv.write_csv(pa.RecordBatch.from_arrays(cols, names=batch.schema.names), buf,
+                                    pacsv.WriteOptions(include_header=False))
                     buf.seek(0)
                     cur.copy_expert(copy_sql, buf)
-                    written += len(pdf)
+                    written += batch.num_rows
             conn.commit()
         finally:
             conn.close()
-        yield pd.DataFrame({"rows": [written]})
+        yield pa.RecordBatch.from_pydict({"rows": [written]})
 
     log.info(f"PostgreSQL 적재 중... (Spark 파티션 {partitions}개가 병렬로 COPY)")
-    result = df.repartition(partitions).mapInPandas(write_partition, schema="rows long")
+    result = df.repartition(partitions).mapInArrow(write_partition, schema="rows long")
     loaded = result.groupBy().sum("rows").collect()[0][0] or 0
+
+    if index_defs:
+        import time
+        t = time.perf_counter()
+        with create_engine(config.DB_URL).begin() as conn:
+            from sqlalchemy import text
+            for ddl in index_defs:
+                conn.execute(text(ddl))
+        log.info(f"  인덱스 {len(index_defs)}개 다시 생성: {time.perf_counter() - t:.1f}초")
     log.info(f"  적재 완료: {loaded:,}행")
     return loaded
 
@@ -200,6 +227,21 @@ def default_master() -> str:
     return f"local[{cores}]"
 
 
+def auto_driver_memory(cores: int) -> str:
+    """코어당 약 512MB를 주되, 1GB 이상·이 컴퓨터(컨테이너) 메모리의 40% 이하로 맞춘다."""
+    import psutil
+    total_gb = psutil.virtual_memory().total / 1024**3
+    try:  # 컨테이너에 메모리 제한이 걸려 있으면 그 값을 쓴다
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        if raw != "max":
+            total_gb = min(total_gb, int(raw) / 1024**3)
+    except OSError:
+        pass
+    gb = max(1, min(int(cores * 0.5), int(total_gb * 0.4)))
+    return f"{gb}g"
+
+
 def parallelism_of(master: str) -> int:
     """master 문자열에서 동시에 처리할 작업 수를 계산 (클러스터면 4를 기본으로)"""
     if master.startswith("local["):
@@ -209,15 +251,17 @@ def parallelism_of(master: str) -> int:
 
 
 def run(year: int, months, mode: str = "raw", limit: int | None = None, master: str | None = None,
-        driver_memory: str = "1g", partitions: int | None = None) -> dict:
+        driver_memory: str = "auto", partitions: int | None = None, defer_indexes: bool = False) -> dict:
     months = parse_months(months)
     master = master or default_master()
     partitions = partitions or parallelism_of(master)
-    log.info(f"Spark 파이프라인 시작: {year}년 {months}월, mode={mode}, master={master}")
+    if driver_memory == "auto":
+        driver_memory = auto_driver_memory(parallelism_of(master))
+    log.info(f"Spark 파이프라인 시작: {year}년 {months}월, mode={mode}, master={master}, 메모리={driver_memory}")
     metrics = {
         "engine": "spark",
         "options": {"year": year, "months": months, "limit": limit, "mode": mode, "master": master,
-                    "driver_memory": driver_memory, "partitions": partitions},
+                    "driver_memory": driver_memory, "partitions": partitions, "defer_indexes": defer_indexes},
         "stages": {},
     }
 
@@ -226,7 +270,8 @@ def run(year: int, months, mode: str = "raw", limit: int | None = None, master: 
     try:
         with stage("process", metrics):  # 읽기 + 정제 + 적재 (지연 실행이라 여기서 한꺼번에 실행됨)
             df = transform(read_months(spark, year, months, limit), year, months)
-            loaded = load_agg(df, year, months) if mode == "agg" else load_raw(df, year, months, partitions)
+            loaded = (load_agg(df, year, months) if mode == "agg"
+                      else load_raw(df, year, months, partitions, defer_indexes))
     finally:
         spark.stop()
 
@@ -244,7 +289,9 @@ if __name__ == "__main__":
     parser.add_argument("--master", default=None,
                         help="local[4] = 이 컴퓨터의 코어 4개 / local[*] = 모든 코어 / spark://host:7077 = 클러스터 "
                              "(기본: 환경 변수 SPARK_MASTER, 없으면 local[최대 4])")
-    parser.add_argument("--driver-memory", default=os.getenv("SPARK_DRIVER_MEMORY", "1g"))
+    parser.add_argument("--driver-memory", default=os.getenv("SPARK_DRIVER_MEMORY", "auto"),
+                        help="Spark 메모리 (auto = 코어 수와 컴퓨터 메모리에 맞춰 자동)")
+    parser.add_argument("--defer-indexes", action="store_true", help="적재 전에 인덱스를 지우고 적재 후 다시 만들기")
     parser.add_argument("--partitions", type=int, default=None, help="병렬 처리·적재 단위 수 (기본: 사용하는 코어 수)")
     parser.add_argument("--metrics-out", default=None)
     # benchmark.py가 pandas 파이프라인과 같은 옵션을 넘겨도 무시되도록
@@ -254,7 +301,7 @@ if __name__ == "__main__":
 
     try:
         result = run(args.year, args.months, args.mode, args.limit, args.master,
-                     args.driver_memory, args.partitions)
+                     args.driver_memory, args.partitions, args.defer_indexes)
     except DataNotPublished as e:
         log.warning(f"건너뜀: {e}")
         raise SystemExit(0)

@@ -51,7 +51,12 @@ docker compose run --rm bench --step 1
 docker compose run --rm bench --step 2
 docker compose run --rm bench --step 3
 docker compose run --rm bench --step 4
+docker compose run --rm bench --step 7
+docker compose run --rm bench --step 8
+docker compose run --rm bench --step 9
 ```
+
+(5·6단계는 Spark라서 아래 2장에서 따로 다룬다.)
 
 | 단계 | 추가되는 기법 | 볼 것 |
 |---|---|---|
@@ -60,6 +65,9 @@ docker compose run --rm bench --step 4
 | 2 | 컬럼 프루닝 | **메모리** 감소 |
 | 3 | COPY 적재 | `load` 시간이 극적으로 감소 |
 | 4 | 청크 COPY | 30만 행에선 작고, `--full`에서 메모리 차이가 커짐 |
+| 7 | 4단계 + Arrow CSV 변환 | CSV 변환 시간이 사라져 `load`가 줄어듦 |
+| 8 | + 병렬 COPY | 코어가 많을수록 크게 줄어듦 |
+| 9 | + 인덱스 나중에 생성 | 로그의 "인덱스 다시 생성 ○초"와 함께 확인 |
 
 실행할 때마다 지금까지의 단계가 표로 나오고, 0단계 대비·직전 단계 대비 감소율이 표시된다.
 
@@ -88,6 +96,16 @@ docker compose run --rm bench --step 6
   docker compose exec db psql -U postgres -d nyctaxi -c "SELECT * FROM v_hourly_stats_fast;"
   ```
 
+### 2-0. 컨테이너 메모리 제한
+
+기본은 **제한 없음**이다 (Docker Desktop에 할당된 메모리까지 쓸 수 있다). 작은 서버를 흉내 내는 실험을 할 때만 상한을 건다. `=` 앞뒤에 공백을 넣지 않는다.
+
+```cmd
+set APP_MEM_LIMIT=2g
+docker compose run --rm bench ...
+set APP_MEM_LIMIT=
+```
+
 ### 2-1. 규모 실험 — Spark가 이기는 지점
 
 여러 달을 한 번에 처리한다. 2~6월 파일은 처음 실행할 때 자동으로 받는다(한 달 약 50MB).
@@ -96,7 +114,7 @@ docker compose run --rm bench --step 6
 docker compose run --rm bench --months 1-6 --full --steps 4,5,6
 ```
 
-메모리를 제한하면 차이가 더 분명해진다. pandas(4단계)는 메모리 부족으로 죽고, Spark(5·6단계)는 끝까지 처리한다.
+메모리를 제한하면 차이가 더 분명해진다. pandas(4단계)는 메모리 부족으로 죽고, Spark(5·6단계)는 끝까지 처리한다. Spark는 기본으로 코어를 최대 4개만 쓴다(코어마다 메모리를 쓰므로). 늘리려면 `-e SPARK_LOCAL_CORES=8`.
 
 ```cmd
 set APP_MEM_LIMIT=2g
@@ -137,9 +155,44 @@ docker compose --profile spark stop spark-master spark-worker
 
 ---
 
-## 3. Kafka
+## 3. 이 PC에서 최고 성능 내기
 
-### 3-1. 기본 흐름
+### 3-1. PostgreSQL 대량 적재 설정 켜기
+
+```cmd
+docker compose exec -T db psql -U postgres -d nyctaxi < sql/pg_bulk_load.sql
+docker compose restart db
+```
+
+되돌릴 때는 `sql/pg_bulk_load.sql` 대신 `sql/pg_reset.sql`로 같은 두 줄을 실행한다.
+
+### 3-2. 최적 값 찾기
+
+```cmd
+docker compose run --rm --entrypoint python bench tune.py
+```
+
+pandas 병렬 COPY 연결 수(1·2·4·8·16)와 Spark 코어 수(2·4·8·16·전체)를 하나씩 돌려 본다. 끝에 나오는 값을 `.env`에 붙여 넣는다.
+
+```
+CSV_ENGINE=arrow
+COPY_WORKERS=8
+SPARK_LOCAL_CORES=16
+```
+
+데이터를 키워서 재려면 `tune.py --months 1-3`. 결과는 `data\benchmarks\tuning_*.md`에 저장된다.
+
+### 3-3. 확인
+
+```cmd
+docker compose run --rm bench --full --steps 4,7,8,9
+```
+
+---
+
+## 4. Kafka
+
+### 4-1. 기본 흐름
 
 ```cmd
 docker compose --profile stream up -d consumer
@@ -149,7 +202,7 @@ docker compose logs -f consumer
 
 로그 보기는 `Ctrl+C`로 멈춘다 (consumer는 계속 실행됨).
 
-### 3-2. 파티션 × consumer 실험
+### 4-2. 파티션 × consumer 실험
 
 ```cmd
 docker compose run --rm kafka-bench
@@ -167,7 +220,7 @@ docker compose run --rm kafka-bench --combos 1x1,2x2,4x4,8x8
 
 ---
 
-## 4. 데이터 확인과 정리
+## 5. 데이터 확인과 정리
 
 ```cmd
 docker compose exec db psql -U postgres -d nyctaxi -c "SELECT COUNT(*) FROM clean_taxi_trips;"
@@ -182,7 +235,7 @@ docker compose exec db psql -U postgres -d nyctaxi -c "TRUNCATE clean_taxi_trips
 
 ---
 
-## 5. 문제 해결
+## 6. 문제 해결
 
 | 증상 | 해결 |
 |---|---|
@@ -190,6 +243,8 @@ docker compose exec db psql -U postgres -d nyctaxi -c "TRUNCATE clean_taxi_trips
 | `No services to build` | `build` 앞에 `--profile batch --profile stream --profile spark` |
 | `port is already allocated` (5432) | PC에 PostgreSQL이 이미 있음. `.env`에 `PG_PORT=5433` 추가 |
 | `Coordinator load in progress` 경고 | Kafka 시작 직후의 정상 경고. 30초쯤 지나면 사라짐 |
-| 벤치마크에 `메모리 부족으로 강제 종료(OOM)` | 의도한 실험이 아니라면 `--limit`을 줄이거나 Docker Desktop → Settings → Resources에서 메모리 늘리기 |
+| 벤치마크에 `메모리 부족으로 강제 종료(OOM)` | `APP_MEM_LIMIT`을 걸어 둔 상태인지 확인 (`set APP_MEM_LIMIT=`로 해제). 제한이 없는데도 나면 `--limit`을 줄이거나 Docker Desktop → Settings → Resources에서 메모리 늘리기 |
+| Spark가 시작하자마자 실패 | 코어 수 대비 메모리 부족. `-e SPARK_LOCAL_CORES=4`처럼 코어를 줄인다 |
+| `too many clients` (PostgreSQL) | 병렬 연결 수가 너무 많음. `COPY_WORKERS`나 Spark 코어 수를 줄인다 |
 | Spark 클러스터 작업이 시작하지 않음 | http://localhost:8090 에 워커가 보이는지 확인. 워커 메모리(`SPARK_WORKER_MEMORY`)가 `SPARK_EXECUTOR_MEMORY`(기본 1g)보다 커야 함 |
 | 코드를 다시 받았는데 반영이 안 됨 | `docker compose --profile batch --profile stream --profile spark build`를 다시 실행 |

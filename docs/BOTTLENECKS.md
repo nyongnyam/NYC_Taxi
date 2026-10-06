@@ -42,6 +42,9 @@ docker compose run --rm bench --repeat 3            # 단계마다 3번 실행�
 | 4 | 청크 COPY | `--prune-columns --load-method copy` |
 | 5 | Spark 분산 처리 | `spark_pipeline.py --mode raw` |
 | 6 | Spark 사전 집계 | `spark_pipeline.py --mode agg` |
+| 7 | 4단계 + Arrow CSV 변환 | `--csv-engine arrow` |
+| 8 | + 병렬 COPY | `--copy-workers 0` (자동: 코어 수, 최대 8) |
+| 9 | + 인덱스 나중에 생성 | `--defer-indexes` |
 
 결과는 화면에 출력되고 `data/benchmarks/bench_2024-01_300000.md`(`.csv`)로 저장된다. 누적 기록은 `data/benchmarks/history.json`에 있다.
 
@@ -296,7 +299,7 @@ APP_MEM_LIMIT=1g docker compose run --rm bench --full
 | | 30만 행 | 한 달 전체 (271만 행) |
 |---|---|---|
 | [4] pandas + 청크 COPY | **3.2초** | **36.9초** |
-| [5] Spark raw (local[*]) | 14.4초 | 39.2초 |
+| [5] Spark raw (local[2]) | 14.4초 | 39.2초 |
 | [6] Spark agg | 11.7초 | 18.6초 |
 
 - 30만 행에서 Spark가 4배 넘게 느리다. 그중 약 5초는 **Spark 세션(JVM) 시작 시간**이고, 나머지는 JVM과 파이썬 워커 사이에 데이터를 옮기는 비용이다.
@@ -345,6 +348,71 @@ set APP_MEM_LIMIT=
 - **원자성**: raw 모드는 파티션마다 따로 커밋한다. 중간에 실패하면 일부 파티션만 적재된 상태가 남을 수 있다. pandas 쪽은 한 트랜잭션이라 전부 아니면 전무다.
 - **반올림**: Spark의 `round`는 0.5를 올리고(HALF_UP), pandas는 짝수 쪽으로 반올림한다(HALF_EVEN). 그래서 `tip_rate` 합계가 아주 조금 다를 수 있다.
 
+## 8. 로컬 최적화 — 남은 병목을 끝까지 쫓기
+
+4단계(청크 COPY)에서 한 달 치 적재는 약 31초였다. 여기서 시간을 더 쪼개 보면 이렇다.
+
+| 구간 | 시간 | 원인 |
+|---|---|---|
+| pandas `to_csv`로 CSV 문자열 만들기 | **15.9초** | 파이썬이 한 줄씩 문자열을 만든다 (코어 1개) |
+| PostgreSQL이 COPY 받아들이기 | 12.9초 | 연결 1개 = DB 프로세스 1개 = 코어 1개 |
+| └ 그중 인덱스 갱신 | 약 4초 | 행이 들어올 때마다 인덱스 2개를 같이 고친다 |
+
+**둘 다 코어 1개만 쓰는 게 문제**였다. 코어가 여러 개여도 놀고 있었던 것이다.
+
+### 단계별 개선 (2024년 1월 전체, 이 측정 환경은 2코어)
+
+| 단계 | 기법 | 총 시간 | 4단계 대비 |
+|---|---|---|---|
+| [4] | 청크 COPY (pandas CSV, 연결 1개) | 31.3초 | 기준 |
+| [7] | + Arrow CSV 변환 (C++로 변환, 15.9초 → 2.5초) | 20.9초 | 33.4% 감소 |
+| [8] | + 병렬 COPY (연결 2개) | 13.9초 | 55.5% 감소 |
+| [9] | + 인덱스 나중에 생성 | 12.0초 | **61.8% 감소** |
+
+```bash
+docker compose run --rm bench --full --steps 4,7,8,9
+```
+
+코어가 많은 PC에서는 8단계(병렬 COPY)의 효과가 훨씬 커진다. 연결 수를 몇 개로 할지는 아래 `tune.py`로 직접 재서 정한다.
+
+### 병목은 옮겨 다닌다 — PostgreSQL 설정
+
+PostgreSQL 기본 설정(`shared_buffers=128MB`, `max_wal_size=1GB`, 커밋마다 디스크 동기화)은 작은 서버 기준이라 대량 적재에 불리하다. `sql/pg_bulk_load.sql`이 이 설정들을 대량 적재용으로 바꾼다.
+
+| 상황 | 기본 설정 | 대량 적재 설정 |
+|---|---|---|
+| 4단계 (CSV 변환이 병목) | 약 34초 | 약 34초 — **효과 없음** |
+| 9단계 (CSV 변환·연결 병목 해결 후) | 14.3초 | 11.5초 — **약 20% 감소** |
+
+처음에는 DB 설정을 바꿔도 전혀 빨라지지 않았다. 가장 느린 곳이 파이썬의 CSV 변환이었기 때문이다. 그 병목을 없애고 나서야 DB의 디스크 쓰기가 다음 병목이 되어 설정의 효과가 나타났다. **가장 느린 곳을 고치지 않으면 다른 곳을 아무리 고쳐도 소용없다**는 것을 숫자로 보여 주는 사례다.
+
+```bash
+# 켜기 (Windows cmd)
+docker compose exec -T db psql -U postgres -d nyctaxi < sql/pg_bulk_load.sql
+docker compose restart db
+# 끄기
+docker compose exec -T db psql -U postgres -d nyctaxi < sql/pg_reset.sql
+docker compose restart db
+```
+
+`synchronous_commit=off`는 PC가 갑자기 꺼지면 마지막 몇 초 분량의 커밋을 잃을 수 있다. 다시 적재하면 되는 실험 데이터라 속도를 택했다.
+
+### tune.py — 이 PC에 맞는 값 찾기
+
+연결 수나 코어 수는 많을수록 좋은 게 아니다. DB가 받아들이는 속도, 디스크, 메모리 중 하나가 먼저 한계에 닿기 때문이다. `tune.py`는 후보 값을 하나씩 실제로 돌려 보고 가장 빠른 값을 고른다. 5% 이내로 비슷하면 자원을 덜 쓰는 값을 고른다.
+
+```bash
+docker compose run --rm --entrypoint python bench tune.py                 # 1월 전체
+docker compose run --rm --entrypoint python bench tune.py --months 1-3    # 데이터를 키워서
+```
+
+| 탐색 대상 | 후보 (기본) | 설정 이름 |
+|---|---|---|
+| pandas 병렬 COPY 연결 수 | 1, 2, 4, 8, 16 | `COPY_WORKERS` |
+| Spark 동시 코어 수 | 2, 4, 8, 16, 전체 코어 | `SPARK_LOCAL_CORES` |
+
+결과 마지막에 나오는 값을 `.env`에 넣으면 `pipeline.py`, `spark_pipeline.py`, Airflow DAG가 그 값을 쓴다. 벤치마크 0~4단계는 비교를 위해 이 값과 상관없이 원래 조건으로 고정된다.
+
 ---
 
 ## 요약
@@ -359,3 +427,6 @@ set APP_MEM_LIMIT=
 | 스트리밍 처리량 | 행 단위 JSON 직렬화 | (과제) 묶음 크기·압축·파티션 튜닝 | — |
 | 데이터 규모 | 여러 달을 한 번에 메모리에 올림 | Spark 파티션 단위 처리 | 6개월: pandas OOM → Spark 151.5초 (2GB 안에서) |
 | 적재량 | 원본 수백만 행을 매번 적재 | Spark 사전 집계 (합계·건수만 저장) | 6개월: 151.5초 → 50.9초 (66% 감소) |
+| CSV 변환 | pandas.to_csv가 코어 1개로 한 줄씩 변환 | pyarrow CSV (C++, 멀티스레드) | 한 달: 31.3초 → 20.9초 |
+| DB 연결 1개 | PostgreSQL은 연결 하나를 코어 하나로 처리 | 병렬 COPY + 인덱스 나중에 생성 | 한 달: 20.9초 → 12.0초 |
+| DB 디스크 쓰기 | 작은 서버 기준 기본 설정 | 대량 적재용 설정 (`pg_bulk_load.sql`) | 9단계 기준 약 20% 추가 감소 |

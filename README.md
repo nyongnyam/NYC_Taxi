@@ -84,6 +84,7 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 - `multi`(기존 방식): `to_sql(method="multi", chunksize=50000)` — 한 달 치 10분 이상
 - `copy`: PostgreSQL `COPY`로 20만 행씩 전송 — 한 달 치 약 28초
 - `benchmark.py`로 기존 코드 대비 기법별 감소율(시간·메모리)을 한 번에 측정할 수 있다 (30만 행 기준 총 시간 94.9% 감소)
+- 추가로 Arrow CSV 변환, 병렬 COPY, 인덱스 나중에 생성, PostgreSQL 대량 적재 설정을 적용하면 한 달 치 적재가 31초에서 약 11초로 줄어든다
 - 같은 월을 다시 실행하면 해당 월을 먼저 삭제한 뒤 적재(멱등성)해 중복이 생기지 않음
 - 접속 정보는 `.env`(환경 변수)로 관리
 
@@ -241,6 +242,7 @@ docker compose run --rm kafka-bench                         # 파티션 수 × c
 
 docker compose run --rm bench --months 1-6 --full --steps 4,5,6   # pandas vs Spark 규모 실험
 docker compose --profile spark up -d --scale spark-worker=3      # Spark 클러스터
+docker compose run --rm --entrypoint python bench tune.py      # 이 PC에 맞는 최적 설정 찾기
 ```
 
 - Kafka UI: http://localhost:8080

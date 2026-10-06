@@ -67,7 +67,11 @@ def task_transform_load(**context):
     start = time.time()
     try:
         cleaned = transform(extract(year, month, prune_columns=True), year, month)
-        load(cleaned, year, month, method=os.getenv("LOAD_METHOD", "copy"))
+        load(cleaned, year, month,
+             method=os.getenv("LOAD_METHOD", "copy"),
+             csv_engine=os.getenv("CSV_ENGINE", "arrow"),          # tune.py 추천값을 .env에 넣으면 그대로 쓰임
+             copy_workers=int(os.getenv("COPY_WORKERS", "0")),     # 0 = 자동 (코어 수, 최대 8)
+             defer_indexes=os.getenv("DEFER_INDEXES", "1") == "1")
         duration = round(time.time() - start, 1)
 
         with _connect() as conn, conn.cursor() as cur:

@@ -216,8 +216,27 @@ def transform(df: pd.DataFrame, year: int, months) -> pd.DataFrame:
 
 
 # ── Load ─────────────────────────────────────────────
+def to_csv_buffer(df: pd.DataFrame, engine: str = "pandas") -> io.IOBase:
+    """DataFrame → COPY에 넣을 CSV 버퍼.
+
+    pandas: df.to_csv — 파이썬에서 한 줄씩 문자열을 만든다 (한 달 치 약 16초)
+    arrow : pyarrow.csv — C++로 여러 스레드가 변환한다 (한 달 치 약 2.5초, 병목 해결 ⑤)
+    """
+    if engine == "arrow":
+        import pyarrow as pa
+        import pyarrow.csv as pacsv
+        buf = io.BytesIO()
+        pacsv.write_csv(pa.Table.from_pandas(df, preserve_index=False), buf,
+                        pacsv.WriteOptions(include_header=False))
+    else:
+        buf = io.StringIO()
+        df.to_csv(buf, index=False, header=False)
+    buf.seek(0)
+    return buf
+
+
 def copy_dataframe(dbapi_conn, df: pd.DataFrame, table: str = config.TABLE_NAME,
-                   chunk_rows: int = COPY_CHUNK_ROWS):
+                   chunk_rows: int = COPY_CHUNK_ROWS, csv_engine: str = "pandas"):
     """PostgreSQL COPY로 DataFrame을 밀어 넣는다 (병목 해결 ③).
 
     chunk_rows > 0 이면 그 단위로 나눠 보내 CSV 버퍼 메모리를 줄인다 (병목 해결 ④).
@@ -228,10 +247,49 @@ def copy_dataframe(dbapi_conn, df: pd.DataFrame, table: str = config.TABLE_NAME,
     step = chunk_rows if chunk_rows > 0 else max(len(df), 1)
     with dbapi_conn.cursor() as cur:
         for start in range(0, len(df), step):
-            buf = io.StringIO()
-            df.iloc[start:start + step].to_csv(buf, index=False, header=False)
-            buf.seek(0)
-            cur.copy_expert(sql, buf)
+            cur.copy_expert(sql, to_csv_buffer(df.iloc[start:start + step], csv_engine))
+
+
+def parallel_copy(df: pd.DataFrame, workers: int, chunk_rows: int = COPY_CHUNK_ROWS,
+                  csv_engine: str = "arrow", table: str = config.TABLE_NAME) -> int:
+    """DB 연결을 workers개 열어 COPY를 동시에 보낸다 (병목 해결 ⑥).
+
+    PostgreSQL은 연결 하나당 프로세스 하나(=CPU 코어 하나)로 처리하므로,
+    연결을 여러 개 쓰면 여러 코어가 동시에 데이터를 받아들인다.
+    대신 연결마다 따로 커밋하므로 중간에 실패하면 일부만 적재될 수 있다.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psycopg2
+
+    step = chunk_rows if chunk_rows > 0 else max(len(df), 1)
+    chunks = [(i, min(i + step, len(df))) for i in range(0, len(df), step)]
+    sql = f'COPY "{table}" ({", ".join(df.columns)}) FROM STDIN WITH (FORMAT csv)'
+
+    def worker(my_chunks):
+        conn = psycopg2.connect(**config.psycopg2_kwargs())
+        try:
+            with conn.cursor() as cur:
+                for lo, hi in my_chunks:
+                    cur.copy_expert(sql, to_csv_buffer(df.iloc[lo:hi], csv_engine))
+            conn.commit()
+        finally:
+            conn.close()
+        return sum(hi - lo for lo, hi in my_chunks)
+
+    groups = [chunks[i::workers] for i in range(workers)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return sum(pool.map(worker, [g for g in groups if g]))
+
+
+def drop_indexes(conn, table: str = config.TABLE_NAME) -> list[str]:
+    """테이블의 보조 인덱스를 지우고, 나중에 다시 만들 CREATE 문을 돌려준다."""
+    rows = conn.execute(text(
+        "SELECT indexname, indexdef FROM pg_indexes "
+        "WHERE schemaname = 'public' AND tablename = :t"), {"t": table}).fetchall()
+    for name, _ in rows:
+        conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+    return [d for _, d in rows]
 
 
 def delete_months(conn, year: int, months, table: str = config.TABLE_NAME) -> int:
@@ -248,8 +306,34 @@ def delete_months(conn, year: int, months, table: str = config.TABLE_NAME) -> in
 
 
 def load(df: pd.DataFrame, year: int, months, method: str = "multi",
-         chunk_rows: int = COPY_CHUNK_ROWS):
-    log.info(f"PostgreSQL 적재 중... (방식: {method})")
+         chunk_rows: int = COPY_CHUNK_ROWS, csv_engine: str = "pandas",
+         copy_workers: int = 1, defer_indexes: bool = False):
+    if copy_workers <= 0:  # 0 = 자동: 코어 수만큼, 최대 8개
+        copy_workers = min(os.cpu_count() or 1, 8)
+    log.info(f"PostgreSQL 적재 중... (방식: {method}, CSV 변환: {csv_engine}, "
+             f"연결 {copy_workers}개, 인덱스 나중에 생성: {defer_indexes})")
+
+    if method == "copy" and (copy_workers > 1 or defer_indexes):
+        # 여러 연결로 나눠 쓰거나 인덱스를 지웠다 다시 만들면 한 트랜잭션으로 묶을 수 없다
+        with engine.begin() as conn:
+            deleted = delete_months(conn, year, months)
+            index_defs = drop_indexes(conn) if defer_indexes else []
+        if deleted:
+            log.info(f"  기존 데이터 {deleted:,}행 삭제")
+        if copy_workers > 1:
+            parallel_copy(df, copy_workers, chunk_rows, csv_engine)
+        else:
+            with engine.begin() as conn:
+                copy_dataframe(conn.connection, df, chunk_rows=chunk_rows, csv_engine=csv_engine)
+        if index_defs:
+            import time
+            t = time.perf_counter()
+            with engine.begin() as conn:
+                for ddl in index_defs:
+                    conn.execute(text(ddl))
+            log.info(f"  인덱스 {len(index_defs)}개 다시 생성: {time.perf_counter() - t:.1f}초")
+        log.info(f"  적재 완료: {len(df):,}행")
+        return
 
     with engine.begin() as conn:
         deleted = delete_months(conn, year, months)
@@ -257,7 +341,7 @@ def load(df: pd.DataFrame, year: int, months, method: str = "multi",
             log.info(f"  기존 데이터 {deleted:,}행 삭제")
 
         if method == "copy":
-            copy_dataframe(conn.connection, df, chunk_rows=chunk_rows)
+            copy_dataframe(conn.connection, df, chunk_rows=chunk_rows, csv_engine=csv_engine)
         else:
             # multi : 기존 방식 — 5만 행씩 다중 행 INSERT
             # single: chunksize 없이 executemany — 메모리 병목 재현용
@@ -275,7 +359,8 @@ def load(df: pd.DataFrame, year: int, months, method: str = "multi",
 # ── Run ──────────────────────────────────────────────
 def run(year: int = 2024, months=1, load_method: str = "multi",
         limit: int | None = None, use_cache: bool = True, prune_columns: bool = False,
-        copy_chunk_rows: int = COPY_CHUNK_ROWS) -> dict:
+        copy_chunk_rows: int = COPY_CHUNK_ROWS, csv_engine: str = "pandas",
+        copy_workers: int = 1, defer_indexes: bool = False) -> dict:
     months = parse_months(months)
     log.info(f"파이프라인 시작: {year}년 {months}월")
     metrics = {
@@ -284,6 +369,7 @@ def run(year: int = 2024, months=1, load_method: str = "multi",
             "year": year, "months": months, "limit": limit, "use_cache": use_cache,
             "prune_columns": prune_columns, "load_method": load_method,
             "copy_chunk_rows": copy_chunk_rows if load_method == "copy" else None,
+            "csv_engine": csv_engine, "copy_workers": copy_workers, "defer_indexes": defer_indexes,
         },
         "stages": {},
     }
@@ -294,7 +380,8 @@ def run(year: int = 2024, months=1, load_method: str = "multi",
         cleaned = transform(raw, year, months)
     del raw  # 원본 DataFrame 메모리 해제
     with stage("load", metrics):
-        load(cleaned, year, months, method=load_method, chunk_rows=copy_chunk_rows)
+        load(cleaned, year, months, method=load_method, chunk_rows=copy_chunk_rows,
+             csv_engine=csv_engine, copy_workers=copy_workers, defer_indexes=defer_indexes)
 
     return summarize(metrics, len(cleaned))
 
@@ -313,13 +400,20 @@ if __name__ == "__main__":
                         help="multi: 기존 방식(다중 행 INSERT) / copy: COPY / single: chunksize 없는 INSERT")
     parser.add_argument("--copy-chunk-rows", type=int, default=COPY_CHUNK_ROWS,
                         help="COPY를 나눠 보낼 행 수 (0 = 한 번에)")
+    parser.add_argument("--csv-engine", choices=["pandas", "arrow"], default=os.getenv("CSV_ENGINE", "pandas"),
+                        help="COPY 전에 CSV로 바꾸는 방법 (arrow가 훨씬 빠름)")
+    parser.add_argument("--copy-workers", type=int, default=int(os.getenv("COPY_WORKERS", "1")),
+                        help="동시에 COPY할 DB 연결 수 (0 = 자동: 코어 수, 최대 8)")
+    parser.add_argument("--defer-indexes", action="store_true",
+                        help="적재 전에 인덱스를 지우고 적재 후 다시 만들기")
     parser.add_argument("--metrics-out", default=None, help="측정 결과를 JSON으로 저장할 경로")
     args = parser.parse_args()
 
     try:
         result = run(args.year, args.months, args.load_method, args.limit,
                      use_cache=not args.no_cache, prune_columns=args.prune_columns,
-                     copy_chunk_rows=args.copy_chunk_rows)
+                     copy_chunk_rows=args.copy_chunk_rows, csv_engine=args.csv_engine,
+                     copy_workers=args.copy_workers, defer_indexes=args.defer_indexes)
     except DataNotPublished as e:
         log.warning(f"건너뜀: {e}")
         sys.exit(0)

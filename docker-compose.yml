@@ -24,17 +24,20 @@ x-app: &app
     KAFKA_TOPIC: ${KAFKA_TOPIC:-taxi-trips}
     KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
     COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
+    CSV_ENGINE: ${CSV_ENGINE:-pandas}
+    COPY_WORKERS: ${COPY_WORKERS:-1}
     SPARK_MASTER: ${SPARK_MASTER:-}               # 비우면 local[최대 SPARK_LOCAL_CORES]
     SPARK_LOCAL_CORES: ${SPARK_LOCAL_CORES:-4}
-    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-auto}
     SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-1g}
   volumes:
     - ./data:/app/data            # 다운로드한 parquet 캐시를 호스트와 공유
-  mem_limit: ${APP_MEM_LIMIT:-4g} # 메모리 병목 실험용 (예: APP_MEM_LIMIT=1g)
+  mem_limit: ${APP_MEM_LIMIT:-0}  # 0 = 제한 없음. 메모리 병목 실험 때만 지정 (예: APP_MEM_LIMIT=2g)
 
 services:
   db:
     image: postgres:16
+    shm_size: 1g                  # 기본 64MB면 병렬 쿼리·큰 shared_buffers에서 공유 메모리 부족이 날 수 있음
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
@@ -153,7 +156,7 @@ services:
     entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class",
                  "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     command: ["--cores", "${SPARK_WORKER_CORES:-1}", "--memory", "${SPARK_WORKER_MEMORY:-1g}"]
-    mem_limit: ${SPARK_WORKER_MEM_LIMIT:-2g}
+    mem_limit: ${SPARK_WORKER_MEM_LIMIT:-0}
     depends_on:
       - spark-master
 
