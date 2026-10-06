@@ -11,15 +11,27 @@
 
 `pipeline.py`의 기본값은 **최적화 전 동작**(전체 컬럼 읽기 + 다중 행 INSERT)이고, 병목 해결 기법은 옵션으로 하나씩 켠다. `benchmark.py`는 기존 코드를 기준으로 기법을 하나씩 추가하며 각 단계를 별도 프로세스로 실행하고, **기준 대비 몇 % 줄었는지** 표로 정리해 준다.
 
-```bash
-python benchmark.py                    # 30만 행, 0~4단계 (몇 분)
-python benchmark.py --full             # 한 달 전체 (0~2단계는 각각 10분 이상)
-python benchmark.py --repeat 3         # 단계마다 3번 실행해 중앙값 사용
+**하나씩 추가하며 보기 (권장)** — 실행할 때마다 결과가 쌓이고, 지금까지의 단계가 모두 표에 나온다.
 
-# Docker
-docker compose run --rm bench
-docker compose run --rm bench --limit 1000000 --repeat 3
+```bash
+docker compose run --rm bench --step 0     # 기준 측정: 기존 코드
+docker compose run --rm bench --step 1     # + 다운로드 캐싱  → 0단계 대비 몇 % 줄었는지
+docker compose run --rm bench --step 2     # + 컬럼 프루닝
+docker compose run --rm bench --step 3     # + COPY 적재
+docker compose run --rm bench --step 4     # + 청크 COPY
+docker compose run --rm bench --show       # 실행 없이 지금까지의 표만 보기
+docker compose run --rm bench --reset --step 0   # 처음부터 다시
 ```
+
+**한 번에 전부**
+
+```bash
+docker compose run --rm bench                       # 30만 행, 0~4단계 (몇 분)
+docker compose run --rm bench --full --step 3       # 한 달 전체 (행 수가 다르면 결과도 따로 쌓인다)
+docker compose run --rm bench --repeat 3            # 단계마다 3번 실행해 중앙값 사용
+```
+
+로컬 Python이라면 `docker compose run --rm bench` 대신 `python benchmark.py`를 쓰면 된다.
 
 | 단계 | 새로 적용하는 기법 | `pipeline.py` 옵션 |
 |---|---|---|
@@ -29,7 +41,7 @@ docker compose run --rm bench --limit 1000000 --repeat 3
 | 3 | COPY 적재 | `--prune-columns --load-method copy --copy-chunk-rows 0` |
 | 4 | 청크 COPY | `--prune-columns --load-method copy` |
 
-결과는 화면에 출력되고 `data/benchmarks/bench_날짜.md`, `.csv`로 저장된다.
+결과는 화면에 출력되고 `data/benchmarks/bench_2024-01_300000.md`(`.csv`)로 저장된다. 누적 기록은 `data/benchmarks/history.json`에 있다.
 
 ### 1차 측정 결과 (30만 행)
 

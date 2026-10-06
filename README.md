@@ -229,7 +229,7 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 cp .env.example .env
 docker compose up -d                                        # PostgreSQL + Kafka + Kafka UI
 docker compose run --rm pipeline --year 2024 --month 1        # 배치 ETL (기존 방식)
-docker compose run --rm bench                                  # 병목 해결 전·후 비교
+docker compose run --rm bench --step 0                         # 병목 해결 전·후 비교 (0 → 1 → … → 4 순서로 하나씩)
 
 docker compose --profile stream up -d consumer              # 스트리밍 consumer
 docker compose run --rm producer --year 2024 --month 1      # parquet → Kafka
@@ -248,7 +248,7 @@ cp .env.example .env                       # DB 접속 정보 수정
 psql -U postgres -d nyctaxi -f sql/setup.sql
 python pipeline.py --year 2024 --month 1                                   # 기존 방식
 python pipeline.py --year 2024 --month 1 --prune-columns --load-method copy  # 최적화 적용
-python benchmark.py                                                       # 전·후 비교
+python benchmark.py --step 0                                              # 전·후 비교 (단계별로 하나씩)
 python monitoring/health_check.py
 ```
 
