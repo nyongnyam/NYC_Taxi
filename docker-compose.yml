@@ -1,0 +1,165 @@
+# 로컬 실험 환경: PostgreSQL + Kafka(KRaft, 단일 브로커) + Kafka UI + 파이프라인 컨테이너
+#
+#   docker compose up -d                                   # 인프라만 기동 (DB, Kafka, UI)
+#   docker compose run --rm pipeline --year 2024 --month 1        # 배치 ETL (기존 방식)
+#   docker compose run --rm bench                                  # 병목 해결 전·후 비교 (결과: data/benchmarks/)
+#   docker compose --profile stream up -d consumer         # 스트리밍 consumer 기동
+#   docker compose run --rm producer --limit 500000        # parquet → Kafka 재생
+#   docker compose --profile stream up -d --scale consumer=3   # consumer 수평 확장
+#   docker compose run --rm kafka-bench                    # 파티션 수 × consumer 수 처리량 실험
+#   docker compose --profile spark up -d --scale spark-worker=3   # Spark 클러스터 (마스터 1 + 워커 3)
+#
+# 호스트에서 직접 스크립트를 돌릴 때: DB는 localhost:${PG_PORT:-5432}, Kafka는 localhost:9094
+
+x-app: &app
+  build: .
+  environment:
+    DB_USER: ${DB_USER:-postgres}
+    DB_PASSWORD: ${DB_PASSWORD:-postgres}
+    DB_HOST: db
+    DB_PORT: 5432
+    DB_NAME: ${DB_NAME:-nyctaxi}
+    RAW_DIR: /app/data/raw
+    KAFKA_BOOTSTRAP: kafka:9092
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-taxi-trips}
+    KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+    COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
+    CSV_ENGINE: ${CSV_ENGINE:-pandas}
+    COPY_WORKERS: ${COPY_WORKERS:-}               # 비우면: 기본 1, 8·9단계는 자동(코어 수, 최대 8)
+    SPARK_MASTER: ${SPARK_MASTER:-}               # 비우면 local[최대 SPARK_LOCAL_CORES]
+    SPARK_LOCAL_CORES: ${SPARK_LOCAL_CORES:-4}
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-auto}
+    SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-1g}
+  volumes:
+    - ./data:/app/data            # 다운로드한 parquet 캐시를 호스트와 공유
+  mem_limit: ${APP_MEM_LIMIT:-0}  # 0 = 제한 없음. 메모리 병목 실험 때만 지정 (예: APP_MEM_LIMIT=2g)
+
+services:
+  db:
+    image: postgres:16
+    shm_size: 1g                  # 기본 64MB면 병렬 쿼리·큰 shared_buffers에서 공유 메모리 부족이 날 수 있음
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-nyctaxi}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/setup.sql:/docker-entrypoint-initdb.d/01_setup.sql:ro   # 최초 기동 시 테이블·뷰 생성
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-nyctaxi}"]
+      interval: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.8.0
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      retries: 10
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    ports:
+      - "8080:8080"               # http://localhost:8080 — 토픽, 파티션, consumer lag 확인
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  pipeline:
+    <<: *app
+    profiles: ["batch"]
+    entrypoint: ["python", "pipeline.py"]
+    command: ["--year", "2024", "--month", "1"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bench:
+    <<: *app
+    profiles: ["batch"]
+    entrypoint: ["python", "benchmark.py"]
+    command: []
+    depends_on:
+      db:
+        condition: service_healthy
+
+  producer:
+    <<: *app
+    profiles: ["stream"]
+    entrypoint: ["python", "streaming/producer.py"]
+    command: ["--year", "2024", "--month", "1"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  kafka-bench:
+    <<: *app
+    profiles: ["stream"]
+    entrypoint: ["python", "streaming/partition_bench.py"]
+    command: []
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    profiles: ["stream"]
+    entrypoint: ["python", "streaming/consumer.py"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ── Spark 클러스터 (분산 처리 실험용) ─────────────────────────
+  #   docker compose --profile spark up -d --scale spark-worker=3
+  #   docker compose run --rm -e SPARK_MASTER=spark://spark-master:7077 bench --step 5
+  spark-master:
+    <<: *app
+    profiles: ["spark"]
+    hostname: spark-master
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class",
+                 "org.apache.spark.deploy.master.Master", "--host", "spark-master"]
+    command: []
+    ports:
+      - "8090:8080"               # http://localhost:8090 — 워커 목록, 실행 중인 작업 확인
+
+  spark-worker:
+    <<: *app
+    profiles: ["spark"]
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class",
+                 "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    command: ["--cores", "${SPARK_WORKER_CORES:-1}", "--memory", "${SPARK_WORKER_MEMORY:-1g}"]
+    mem_limit: ${SPARK_WORKER_MEM_LIMIT:-0}
+    depends_on:
+      - spark-master
+
+volumes:
+  pgdata:
+  kafkadata:
