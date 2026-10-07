@@ -3,6 +3,8 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
 ![Tableau](https://img.shields.io/badge/Tableau-E97627?style=for-the-badge&logo=tableau&logoColor=white)
 ![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white)
+![Apache Arrow](https://img.shields.io/badge/Apache%20Arrow-0E2A47?style=for-the-badge&logo=apache&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 
 # 뉴욕 택시 운행 기록을 사용한 택시 운전 기사 수익 최적화 대시보드
 
@@ -33,7 +35,8 @@
 - **오케스트레이션**: Apache Airflow — 월별 자동 실행 스케줄 관리
 - **데이터 수집**: Python `urllib` 라이브러리를 통해 NYC TLC에서 parquet 파일 형식으로 다운로드
 - **데이터 정제**: Python `Pandas` 라이브러리를 통해 이상값 제거, 파생 칼럼 생성
-- **데이터 적재**: Python `SQLAlchemy` 라이브러리를 활용해 정제 결과를 로컬 PostgreSQL에 적재
+- **데이터 적재**: PostgreSQL `COPY`로 정제 결과를 적재 (DB 연결 여러 개로 병렬 적재, CSV 변환은 `pyarrow`)
+- **실행 환경**: Docker Compose (PostgreSQL + 파이프라인), 접속 정보와 성능 설정은 `.env`로 관리
 - **시각화**: Tableau Desktop을 이용해 BI 대시보드 구성
 - **버전 관리**: Git을 통한 코드 및 Tableau 워크북 관리
 
@@ -44,7 +47,8 @@
 NYC TLC 공식 사이트에서 월별 parquet 파일을 다운로드한다. 이미 로컬에 존재하는 파일은 건너뛰며, 사이트에 아직 공개되지 않은 파일은 HTTP HEAD 요청으로 사전 확인 후 에러 없이 건너뛴다.
 
 - 다운로드 경로: `data/raw/yellow_tripdata_YYYY-MM.parquet`
-- 중복 다운로드 방지: 파일 존재 여부 사전 확인
+- 중복 다운로드 방지: 파일 존재 여부 사전 확인. 임시 파일(`.part`)로 받은 뒤 완료되면 이름을 바꿔, 중간에 끊긴 파일이 캐시로 남지 않게 함
+- 필요한 컬럼만 읽기: 원본 19개 컬럼 중 분석에 쓰는 8개만 읽어 메모리 사용량을 줄임
 - 미공개 파일 처리: HTTP 403 에러 시 경고 로그 후 건너뜀 (NYC TLC 데이터가 2~3개월의 공개 딜레이가 있기 때문)
 
 ### 3.2 Transform (정제)
@@ -60,7 +64,7 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 | 전체 요금 | `df["total_amount"] > 0` | 전체 금액 오류 제거 |
 | 승객 수 | `df["passenger_count"].between(1, 6)` | 택시 법적 최대 탑승 인원 기준 |
 | 운행 시간 | `df["trip_duration_min"].between(1, 180)` | 1분 미만은 오류, 3시간 초과는 비정상 운행으로 간주 |
-| 날짜 필터 | `df["tpep_pickup_datetime"].dt.year >= 2024` | 다른 달 데이터 혼입 방지 |
+| 날짜 필터 | 처리하는 연·월에 해당하는 운행만 유지 | 월별 파일에 섞인 다른 달 데이터 제거 |
 
 **파생 칼럼 생성**
 
@@ -73,11 +77,38 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ### 3.3 데이터 적재
 
-정제된 DataFrame을 SQLAlchemy의 `to_sql()` 메서드를 통해 로컬 PostgreSQL에 적재한다.
+정제된 데이터를 PostgreSQL `COPY`로 적재한다. 같은 월을 다시 실행하면 해당 월을 먼저 지우고 넣으므로 중복이 생기지 않는다.
 
-- `append` 방식을 사용해 기존 데이터를 유지하며 새 데이터 추가
-- `chunksize`: 50000
-- 연결 방식: `postgresql://username@localhost:5432/nyctaxi`
+- **COPY 적재**: SQL `INSERT` 대신 PostgreSQL의 대량 적재 명령 `COPY`로 CSV 데이터를 그대로 흘려보낸다
+- **Arrow CSV 변환**: COPY에 넣을 CSV를 `pandas.to_csv` 대신 `pyarrow.csv`(C++)로 만든다
+- **병렬 COPY**: DB 연결을 여러 개 열어 20만 행 단위로 나눠 동시에 적재한다 (`.env`의 `COPY_WORKERS`)
+- **인덱스 지연 생성**: 적재량이 테이블의 20% 이상이면 인덱스를 지웠다가 적재 후 한 번에 만든다. 큰 테이블에 소량을 추가할 때는 오히려 느려지므로 자동으로 건너뛴다
+- **실패 처리**: 연결마다 따로 커밋하므로, 적재 중 실패하면 해당 월 데이터를 지워 일부만 들어간 상태를 남기지 않는다
+
+### 3.4 성능 개선
+
+기존 파이프라인(`to_sql` multi INSERT)은 2024년 1월 데이터(약 271만 행)를 적재하는 데 5분 넘게 걸렸다. 단계별로 시간을 측정해 병목을 찾고, 기법을 하나씩 적용하며 효과를 확인했다.
+
+| 단계 | 적용 기법 | 총 시간 | 기존 대비 |
+|---|---|---|---|
+| 기존 | 다운로드 캐싱 + `to_sql` multi INSERT (5만 행 단위) | 325.1초 | - |
+| ① | + 필요한 컬럼만 읽기, `COPY` 적재 | 17.6초 | 94.6% 감소 |
+| ② | + Arrow CSV 변환 | 11.4초 | 96.5% 감소 |
+| ③ | + 병렬 COPY (DB 연결 8개) | 6.8초 | 97.9% 감소 |
+| ④ | + 인덱스 지연 생성 | **5.6초** | **98.3% 감소** |
+
+- 측정 환경: 28코어 Windows PC, Docker Desktop, PostgreSQL 16 (대량 적재 설정 적용), 모든 단계에서 적재 행 수 2,713,464행으로 동일
+- 최대 메모리 사용량: 2,895MB → 1,349MB
+- DB 연결을 16개로 늘리면 같은 데이터가 3.7초에 적재되었다
+
+**병목 분석 요약**
+
+- 기존 방식에서 시간의 대부분은 DB가 아니라 파이썬 쪽에 있었다. 5만 행 × 12컬럼, 약 60만 개의 값이 들어간 `INSERT` 문을 SQLAlchemy가 조립하는 데 대부분의 시간이 쓰였다 (프로파일링 결과: 5만 행 적재 19초 중 실제 DB 실행은 2.3초).
+- COPY로 바꾼 뒤에는 CSV 변환(`pandas.to_csv`)이 적재 시간의 절반을 차지했다. `pyarrow`로 바꾸자 변환 시간이 15.9초에서 2.5초로 줄었다.
+- 남은 병목은 CPU를 하나만 쓰는 구조였다. PostgreSQL은 연결 하나를 프로세스 하나로 처리하므로, 연결을 여러 개로 나눠 여러 코어가 동시에 받도록 했다. `pyarrow`는 변환 중 파이썬 GIL을 풀어 주기 때문에 스레드 여러 개가 실제로 동시에 변환할 수 있다.
+- PostgreSQL 설정(`sql/pg_bulk_load.sql`)은 CSV 변환이 병목일 때는 효과가 없었고, 그 병목을 없앤 뒤에야 약 20%의 추가 개선이 나타났다.
+
+측정 도구와 실험 과정 전체(Spark, Kafka 실험 포함)는 [`local-bottleneck-lab`](https://github.com/nyongnyam/NYC_Taxi/tree/local-bottleneck-lab) 브랜치의 `docs/BOTTLENECKS.md`에 정리했다.
 
 ## 4. Airflow 자동화
 
@@ -85,7 +116,7 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ### 4.1 DAG 구성
 
-1. **extract** — 전달 parquet 파일 다운로드 후 `/tmp/`에 임시 저장
+1. **extract** — 지난달 parquet 파일 다운로드 (`data/raw/`에 캐시, 아직 공개되지 않은 달이면 건너뜀)
 2. **transform_and_load** — 정제 및 PostgreSQL에 적재, `pipeline_runs`에 이력 기록
 3. **quality_check** — 행 수 확인, 이상 요금 감지
 
@@ -205,3 +236,46 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 - 집중 운행: 10-12월의 연말 시즌 (수익 증가율 최고)
 - 비용 절감: 1-2월 연초 비수기
+
+## 8. 실행 방법
+
+### Docker Compose
+
+```bash
+cp .env.example .env                              # Windows: copy .env.example .env
+docker compose up -d db                           # PostgreSQL 기동 (처음 뜰 때 sql/setup.sql 자동 실행)
+docker compose run --rm pipeline                  # 2024년 1월 적재
+docker compose run --rm pipeline --months 1-3     # 여러 달
+```
+
+대량 적재용 PostgreSQL 설정 (선택):
+
+```bash
+docker compose exec -T db psql -U postgres -d nyctaxi < sql/pg_bulk_load.sql
+docker compose restart db
+```
+
+`synchronous_commit=off` 등 속도를 우선한 설정이라, 갑자기 전원이 꺼지면 마지막 몇 초 분량의 커밋이 사라질 수 있다. 되돌릴 때는 `sql/pg_reset.sql`을 같은 방법으로 실행한다.
+
+### 로컬 Python
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env                                # DB 접속 정보 수정
+psql -U postgres -d nyctaxi -f sql/setup.sql
+python pipeline.py --year 2024 --months 1
+python monitoring/health_check.py
+```
+
+### 설정 (`.env`)
+
+| 이름 | 기본값 | 설명 |
+|---|---|---|
+| `COPY_WORKERS` | 0 (자동: 코어 수, 최대 8) | 동시에 COPY할 DB 연결 수 |
+| `DEFER_INDEXES` | auto | 인덱스 지연 생성 (auto: 적재량이 테이블의 20% 이상일 때만 / on / off) |
+| `COPY_CHUNK_ROWS` | 200000 | 연결 하나가 한 번에 보내는 행 수 |
+
+### Airflow
+
+`dags/nyc_taxi_dag.py`를 `~/airflow/dags/`에 심볼릭 링크로 연결한다. 프로젝트 경로가 다르면 `NYC_TAXI_PROJECT_DIR` 환경 변수로 지정한다. Airflow 2.x와 3.x에서 동작한다.

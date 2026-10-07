@@ -4,10 +4,15 @@ monitoring/health_check.py — 파이프라인 상태 확인
 결과는 터미널 출력 + monitoring/pipeline.log 파일에 저장됩니다.
 """
 
-import psycopg2
 import logging
 import os
-from datetime import datetime, timedelta
+import sys
+
+import psycopg2
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402
+from datetime import datetime
 
 # 로그 파일 설정
 LOG_DIR  = os.path.dirname(__file__)
@@ -23,11 +28,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_URL = "postgresql://hyukjunc@localhost:5432/nyctaxi"  # 수정 필요
-
-
 def get_conn():
-    return psycopg2.connect(DB_URL)
+    return psycopg2.connect(**config.psycopg2_kwargs())
 
 
 def check_row_count(conn) -> bool:

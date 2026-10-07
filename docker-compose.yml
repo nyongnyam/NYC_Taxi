@@ -1,0 +1,44 @@
+#   docker compose up -d db                          # PostgreSQL 기동 (처음 뜰 때 sql/setup.sql 자동 실행)
+#   docker compose run --rm pipeline                 # 2024년 1월 적재
+#   docker compose run --rm pipeline --months 1-3    # 여러 달
+#
+# Tableau 연결: localhost:${PG_PORT:-5432} / DB nyctaxi / 사용자·비밀번호는 .env
+
+services:
+  db:
+    image: postgres:16
+    shm_size: 1g                  # 기본 64MB면 병렬 쿼리에서 공유 메모리가 부족할 수 있음
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-nyctaxi}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/setup.sql:/docker-entrypoint-initdb.d/01_setup.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-nyctaxi}"]
+      interval: 5s
+      retries: 10
+
+  pipeline:
+    build: .
+    environment:
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-nyctaxi}
+      RAW_DIR: /app/data/raw
+      COPY_WORKERS: ${COPY_WORKERS:-0}
+      COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
+      DEFER_INDEXES: ${DEFER_INDEXES:-auto}
+    volumes:
+      - ./data:/app/data          # 다운로드한 parquet을 PC 폴더에 캐시
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
