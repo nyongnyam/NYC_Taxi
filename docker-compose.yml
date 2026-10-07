@@ -62,5 +62,27 @@ services:
     depends_on:
       db:
         condition: service_healthy
+  airflow: # http://localhost:8081
+    image: apache/airflow:2.10.5
+    command: standalone
+    restart: unless-stopped
+    environment:
+      NYC_TAXI_PROJECT_DIR: /opt/project
+      DB_HOST: db
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      RAW_DIR: /opt/project/data/raw
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/project/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      _PIP_ADDITIONAL_REQUIREMENTS: pyarrow python-dotenv
+      TARGET_MONTH_LAG: ${TARGET_MONTH_LAG:-3}
+    volumes:
+      - .:/opt/project
+      - airflowdata:/opt/airflow
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
 volumes:
   pgdata:
+  airflowdata:

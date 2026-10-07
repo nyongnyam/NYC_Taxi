@@ -138,7 +138,7 @@ def transform(df: pd.DataFrame, year: int, months: list[int]) -> pd.DataFrame:
     df = df[(pickup.dt.year == year) & pickup.dt.month.isin(months)]  # 파일에 섞인 다른 달 제거
 
     # 이상값 제거
-    df = df[(df["trip_distance"] > 0) & (df["fare_amount"] > 0) & (df["total_amount"] > 0)]
+    df = df[(df["trip_distance"] > 0) & (df["fare_amount"] > 0) & (df["fare_amount"] <= 1000) & (df["total_amount"] > 0)]
     df = df[df["passenger_count"].between(1, 6)].copy()
 
     # 파생 컬럼

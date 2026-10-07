@@ -37,11 +37,14 @@ default_args = {
 }
 
 
+TARGET_MONTH_LAG = int(os.getenv("TARGET_MONTH_LAG", "3"))  # TLC는 2~3개월 늦게 공개한다
+
+
 def _target_month(context) -> tuple[int, int]:
-    """실행 시점 기준 '지난달' (Airflow 3에서는 execution_date 대신 logical_date)"""
-    date = context.get("logical_date") or context["data_interval_end"]
-    prev = date.replace(day=1) - timedelta(days=1)
-    return prev.year, prev.month
+    """실행 시점 기준 TARGET_MONTH_LAG개월 전 (기본 3개월: 11월 1일 실행 → 8월 데이터)"""
+    date = context["data_interval_end"]          # 예약 실행이면 실제 실행 시각(매월 1일)
+    total = date.year * 12 + (date.month - 1) - TARGET_MONTH_LAG
+    return total // 12, total % 12 + 1
 
 
 def _connect():

@@ -1,4 +1,3 @@
-Readme · MD
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=apacheairflow&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
@@ -45,7 +44,7 @@ Readme · MD
 ```mermaid
 flowchart LR
     TLC[NYC TLC<br/>월별 parquet] --> RAW[(data/raw<br/>다운로드 캐시)]
-    AF[Airflow<br/>매월 1일 06:00] -.실행.-> PIPE
+    AF[Airflow<br/>매월 1일 15:00 KST] -.실행.-> PIPE
     RAW --> PIPE["pipeline.py<br/>월별 적재 · pandas"]
     RAW --> BF["spark_backfill.py<br/>초기 적재 · Spark"]
     PIPE -->|병렬 COPY| PG[(PostgreSQL)]
@@ -57,7 +56,7 @@ flowchart LR
 - **데이터 수집**: Python `urllib` 라이브러리를 통해 NYC TLC에서 parquet 파일 형식으로 다운로드
 - **데이터 정제**: Python `Pandas` 라이브러리를 통해 이상값 제거, 파생 칼럼 생성 (초기 적재는 같은 규칙을 Apache Spark로 처리)
 - **데이터 적재**: PostgreSQL `COPY`로 정제 결과를 적재 (DB 연결 여러 개로 병렬 적재, CSV 변환은 `pyarrow`)
-- **실행 환경**: Docker Compose (PostgreSQL + 월별 파이프라인 + 초기 적재), 접속 정보와 성능 설정은 `.env`로 관리
+- **실행 환경**: Docker Compose (PostgreSQL + 월별 파이프라인 + 초기 적재 + Airflow), 접속 정보와 성능 설정은 `.env`로 관리
 - **시각화**: Tableau Desktop을 이용해 BI 대시보드 구성
 - **버전 관리**: Git을 통한 코드 및 Tableau 워크북 관리
 
@@ -78,14 +77,14 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 **이상값 제거 기준**
 
-| 정제 항목 | 조건                                      | 비고                                               |
-| --------- | ----------------------------------------- | -------------------------------------------------- |
-| 운행 거리 | `df["trip_distance"] > 0`                 | 운행 거리 0 이하 제거                              |
-| 기본 요금 | `df["fare_amount"] > 0`                   | 음수 또는 0 요금 제거                              |
-| 전체 요금 | `df["total_amount"] > 0`                  | 전체 금액 오류 제거                                |
-| 승객 수   | `df["passenger_count"].between(1, 6)`     | 택시 법적 최대 탑승 인원 기준                      |
-| 운행 시간 | `df["trip_duration_min"].between(1, 180)` | 1분 미만은 오류, 3시간 초과는 비정상 운행으로 간주 |
-| 날짜 필터 | 처리하는 연·월에 해당하는 운행만 유지     | 월별 파일에 섞인 다른 달 데이터 제거               |
+| 정제 항목 | 조건                                      | 비고                                                                             |
+| --------- | ----------------------------------------- | -------------------------------------------------------------------------------- |
+| 운행 거리 | `df["trip_distance"] > 0`                 | 운행 거리 0 이하 제거                                                            |
+| 기본 요금 | `0 < df["fare_amount"] <= 1000`           | 음수·0 요금과 1,000달러 초과 요금 제거 (입력 오류로 판단, 품질 검사 기준과 같음) |
+| 전체 요금 | `df["total_amount"] > 0`                  | 전체 금액 오류 제거                                                              |
+| 승객 수   | `df["passenger_count"].between(1, 6)`     | 택시 법적 최대 탑승 인원 기준                                                    |
+| 운행 시간 | `df["trip_duration_min"].between(1, 180)` | 1분 미만은 오류, 3시간 초과는 비정상 운행으로 간주                               |
+| 날짜 필터 | 처리하는 연·월에 해당하는 운행만 유지     | 월별 파일에 섞인 다른 달 데이터 제거                                             |
 
 **파생 칼럼 생성**
 
@@ -144,19 +143,33 @@ Pandas 라이브러리를 활용해 원본 데이터의 이상값을 제거하�
 
 ## 4. Airflow 자동화
 
-매월 1일 오전 6시에 DAG(Directed Acyclic Graph)를 자동으로 실행해 데이터 수집부터 품질 검사까지의 전체 흐름을 순서대로 관리한다.
+매월 1일 DAG(Directed Acyclic Graph)를 자동으로 실행해 데이터 수집부터 품질 검사까지의 흐름을 순서대로 관리한다. Airflow는 Docker Compose의 `airflow` 서비스로 실행한다.
 
-### 4.1 DAG 구성
+### 4.1 DAG 구성 (`nyc_taxi_local_etl`)
 
-1. **extract** — 지난달 parquet 파일 다운로드 (`data/raw/`에 캐시, 아직 공개되지 않은 달이면 건너뜀)
-2. **transform_and_load** — 정제 및 PostgreSQL에 적재, `pipeline_runs`에 이력 기록
-3. **quality_check** — 행 수 확인, 이상 요금 감지
+1. **extract** — 대상 월 parquet 다운로드 (`data/raw/`에 캐시, 아직 공개되지 않은 달이면 건너뜀)
+2. **transform_and_load** — `pipeline.py`의 함수로 정제·적재, `pipeline_runs`에 이력 기록
+3. **quality_check** — 대상 월 행 수 확인, 테이블 전체에서 이상 요금(0 이하 또는 1,000달러 초과) 감지
 
 ### 4.2 스케줄
 
-- 스케줄: `0 6 1 * *` (매월 1일 오전 6시)
-- 대상 월: 실행 기준 시각(`logical_date`)의 지난달 데이터를 수집
-- 실행 환경: `airflow standalone` — 웹 서버 + 스케줄러를 단일 명령으로 통합 실행
+- 스케줄: `0 6 1 * *` — UTC 기준 매월 1일 06:00 (한국 시간 오후 3시). 놓친 달은 몰아서 실행하지 않는다 (`catchup=False`)
+- 대상 월: 실행 시각 기준 3개월 전 (예: 11월 1일 실행 → 8월 데이터). TLC가 데이터를 2~3개월 늦게 공개하므로 지난달을 대상으로 하면 대부분 미공개로 건너뛰게 된다. `TARGET_MONTH_LAG`로 바꿀 수 있다
+- 실행 환경: `apache/airflow:2.10.5` 이미지의 `airflow standalone` (웹 서버 + 스케줄러). 실행 기록과 DAG 활성화 상태는 `airflowdata` 볼륨에 유지된다
+
+### 4.3 동작 확인
+
+`airflow dags test`로 2024년 1월을 처리해 세 태스크가 모두 성공하는 것을 확인했다.
+
+| 태스크             | 결과                                                                      |
+| ------------------ | ------------------------------------------------------------------------- |
+| extract            | 캐시된 파일 사용                                                          |
+| transform_and_load | 원본 2,964,624행 → 정제 2,713,464행, 기존 월 데이터 삭제 후 재적재 22.8초 |
+| quality_check      | 2,713,464행, 이상 요금 0건                                                |
+
+초기 적재로 여러 해 치가 이미 들어 있는 테이블에 다시 적재했기 때문에 3.4의 5.6초(빈 테이블 기준)보다 오래 걸렸다. 기존 월 데이터 삭제에 약 12초가 들었고, 적재량이 테이블의 20%에 못 미쳐 인덱스 지연 생성은 자동으로 건너뛰었다.
+
+처음 검증 때는 품질 검사가 실패했다. 정제 단계에는 요금 상한이 없었는데 품질 검사는 1,000달러 초과를 이상값으로 보고 있어서, 초기 적재로 들어온 다른 달의 17건이 걸렸다. 정제 규칙에 같은 상한을 추가해 두 기준을 맞췄다.
 
 ## 5. 데이터베이스 구조
 
@@ -320,7 +333,17 @@ python monitoring/health_check.py
 | `COPY_CHUNK_ROWS`     | 200000                    | 연결 하나가 한 번에 보내는 행 수                                            |
 | `SPARK_LOCAL_CORES`   | 4                         | 초기 적재 때 Spark가 동시에 쓰는 코어 수                                    |
 | `SPARK_DRIVER_MEMORY` | auto                      | 초기 적재 때 Spark 메모리 (auto: 코어당 약 512MB, 시스템 메모리의 40% 이하) |
+| `TARGET_MONTH_LAG`    | 3                         | Airflow가 실행 시각 기준 몇 개월 전 데이터를 처리할지                       |
 
 ### Airflow
 
-`dags/nyc_taxi_dag.py`를 `~/airflow/dags/`에 심볼릭 링크로 연결한다. 프로젝트 경로가 다르면 `NYC_TAXI_PROJECT_DIR` 환경 변수로 지정한다. Airflow 2.x와 3.x에서 동작한다.
+```bash
+docker compose up -d airflow                                                  # http://localhost:8081 (아이디 admin)
+docker compose logs airflow | findstr password                                # 로그인 비밀번호 (macOS/Linux: grep)
+docker compose exec airflow airflow dags unpause nyc_taxi_local_etl           # 매월 자동 실행 켜기 (웹 화면의 토글과 같음)
+docker compose exec airflow airflow dags test nyc_taxi_local_etl 2024-04-15   # 한 번 실행해 보기 → 2024년 1월 처리
+```
+
+- 자동 실행되려면 매월 1일 한국 시간 오후 3시에 PC, Docker Desktop, `airflow` 컨테이너가 켜져 있어야 한다. `restart: unless-stopped`라서 Docker가 켜지면 컨테이너도 다시 뜬다
+- `dags test`의 날짜는 실행 시각을 뜻한다. `2024-04-15`로 주면 4월 1일 실행으로 보고 3개월 전인 1월을 처리한다
+- Docker 없이 쓰려면 `dags/nyc_taxi_dag.py`를 `~/airflow/dags/`에 심볼릭 링크로 연결하고, 프로젝트 경로를 `NYC_TAXI_PROJECT_DIR`로 지정한다 (Windows는 WSL 필요)

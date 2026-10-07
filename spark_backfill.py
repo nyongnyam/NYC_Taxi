@@ -148,7 +148,7 @@ def transform(df):
  
     pickup, dropoff = F.col("tpep_pickup_datetime"), F.col("tpep_dropoff_datetime")
     df = (
-        df.where((F.col("trip_distance") > 0) & (F.col("fare_amount") > 0) & (F.col("total_amount") > 0))
+        df.where((F.col("trip_distance") > 0) & (F.col("fare_amount") > 0) & (F.col("fare_amount") <= 1000) & (F.col("total_amount") > 0))
         .where(F.col("passenger_count").between(1, 6))
         .withColumn("trip_duration_min", F.round((F.unix_timestamp(dropoff) - F.unix_timestamp(pickup)) / 60, 2))
         .withColumn("pickup_hour", F.hour(pickup))
