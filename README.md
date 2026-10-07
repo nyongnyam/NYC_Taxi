@@ -307,7 +307,7 @@ pip install -r requirements.txt
 cp .env.example .env                                # DB 접속 정보 수정
 psql -U postgres -d nyctaxi -f sql/setup.sql
 python pipeline.py --year 2024 --months 1
-python spark_backfill.py --from 2024-01 --to 2024-12   # 초기 적재 (Java 17 필요)
+python spark_backfill.py                 # 초기 적재: 2024-01부터 공개된 모든 달 (Java 17 필요)
 python monitoring/health_check.py
 ```
 
