@@ -7,7 +7,7 @@
 services:
   db:
     image: postgres:16
-    shm_size: 1g                  # 기본 64MB면 병렬 쿼리에서 공유 메모리가 부족할 수 있음
+    shm_size: 1g # 기본 64MB면 병렬 쿼리에서 공유 메모리가 부족할 수 있음
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
@@ -18,7 +18,11 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./sql/setup.sql:/docker-entrypoint-initdb.d/01_setup.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-nyctaxi}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-nyctaxi}",
+        ]
       interval: 5s
       retries: 10
 
@@ -35,10 +39,28 @@ services:
       COPY_CHUNK_ROWS: ${COPY_CHUNK_ROWS:-200000}
       DEFER_INDEXES: ${DEFER_INDEXES:-auto}
     volumes:
-      - ./data:/app/data          # 다운로드한 parquet을 PC 폴더에 캐시
+      - ./data:/app/data # 다운로드한 parquet을 PC 폴더에 캐시
     depends_on:
       db:
         condition: service_healthy
-
+  backfill: # 새 환경 초기 적재: 과거 데이터를 Spark로 한 번에
+    build: .
+    entrypoint: ["python", "spark_backfill.py"]
+    command: []
+    environment:
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-nyctaxi}
+      RAW_DIR: /app/data/raw
+      DEFER_INDEXES: ${DEFER_INDEXES:-auto}
+      SPARK_LOCAL_CORES: ${SPARK_LOCAL_CORES:-4}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-auto}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
 volumes:
   pgdata:
